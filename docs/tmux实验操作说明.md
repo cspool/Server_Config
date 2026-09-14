@@ -221,6 +221,44 @@ dtl MLX_chipyard_dev            # 查看:train / logs 两个会话
 | `dtm <容器> train` | `tmux new-session -A -s train` |
 | `dtl <容器>` | `tmux ls` |
 
+## 远程 VS Code 直接打开容器
+
+tmux 解决的是"进程留在现场";想在远程机器上**用 VS Code 图形界面编辑容器里的代码**,
+走 Remote-SSH 再套一层 Dev Containers 即可,不需要在容器里跑 sshd。
+
+前提(宿主机已满足):`descfly` 在 `docker` 组、sshd 运行中、三个容器在跑(`dls` 确认)。
+远程机器的 VS Code 装 **Remote - SSH** 与 **Dev Containers** 两个扩展(或 Remote Development 扩展包)。
+
+### 方案一(推荐):Remote-SSH → Attach 容器
+
+1. `F1` → **Remote-SSH: Connect to Host…** → `descfly@192.168.31.116`(外网走比扬云链路地址)。
+   连上后左下角显示 `SSH: 192.168.31.116`。
+2. 在该窗口 `F1` → **Dev Containers: Attach to Running Container…** → 选
+   `AgentSys_dev` / `MLX_chipyard_dev` / `GPDPU_dev`。
+3. VS Code 新开窗口并往容器装 vscode-server,左下角变成 `Container AgentSys_dev (SSH: …)`。
+   **File → Open Folder** 输入对应项目目录(见上表 `/workspace/...`)。
+
+也可以在 SSH 窗口侧栏 **Remote Explorer** 切到 *Dev Containers*,直接看到宿主机容器列表右键 attach。
+
+### 方案二:本地 Docker CLI 直连远端 daemon
+
+远程机器要有 docker CLI(不需要 daemon)且到宿主机 SSH 免密。本地 VS Code `settings.json` 加:
+
+```json
+"docker.host": "ssh://descfly@192.168.31.116"
+```
+
+然后直接 `F1` → **Dev Containers: Attach to Running Container…**。少一层跳转,但要装本地 docker CLI,
+SSH 端口非 22 时需写进 `~/.ssh/config`。日常用方案一即可。
+
+### 注意点
+
+| 事项 | 说明 |
+|---|---|
+| 容器用户 | 容器以 `user=0:1000` 运行,attach 后终端是 root,新建文件属 root。要以自己身份进,在 attach 配置里加 `"remoteUser": "descfly"`(容器内需有此用户) |
+| attach 配置位置 | 宿主机 `~/.config/Code/User/globalStorage/ms-vscode-remote.remote-containers/imageConfigs/<镜像名>.json`,可固定 `workspaceFolder` 和默认扩展,下次 attach 自动打开对应目录 |
+| 与 tmux 的关系 | VS Code 集成终端仍属客户端,长任务照旧在其中执行 `tmux new-session -A -s work`,断开后进程才不会死 |
+
 ## 相关文档
 
 - [开发环境指南](开发环境指南.md) —— 完整的四个入口、VPN 分流栈、网络重置
