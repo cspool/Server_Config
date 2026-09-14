@@ -1,0 +1,17 @@
+# 订阅 URL 与真实配置(含密钥),绝不入库
+network/config/sub.url
+**/sub.url
+*.real
+
+# 文档备份
+*.bak.*
+.backups/
+docs/.backups/
+
+# 可能的私钥与证书
+*.key
+*.pem
+*.ovpn
+# 同名占位空文件除外
+!network/config/*.ovpn
+*.keyring

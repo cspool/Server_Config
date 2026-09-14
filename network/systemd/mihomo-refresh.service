@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh mihomo subscription
+After=mihomo.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /etc/mihomo/refresh.py

@@ -1,0 +1,22 @@
+[Unit]
+Description=mihomo (headless clash core)
+After=network-online.target dbus.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 1) 先确保 openvpn3 有有效会话:mihomo 接管全局路由后要把 Claude 流量分发进该隧道
+ExecStartPre=/etc/mihomo/ensure-openvpn3.sh
+# 2) mihomo 本体(TUN + 全局路由拦截 + 分流)
+ExecStart=/usr/bin/verge-mihomo -d /etc/mihomo -f /etc/mihomo/config.yaml
+# 3) mihomo 就绪后再拉起路由守护(guard 已取消开机自启, 只由 mihomo 拉起)
+ExecStartPost=/usr/bin/systemctl --no-block start claude-vpn-guard.timer
+# 停止 mihomo 时一并停掉 guard, 否则它会把全部流量兜底进 openvpn3
+ExecStopPost=/usr/bin/systemctl --no-block stop claude-vpn-guard.timer
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=120
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

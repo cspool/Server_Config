@@ -1,0 +1,8 @@
+[Unit]
+Description=Claude VPN route guard (openvpn3 tun narrowing + clash failover)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/claude-vpn-guard.sh
