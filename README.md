@@ -96,6 +96,7 @@ netstat-paper  # 状态速览
 │   ├── bashrc-container.sh      dls / dsh / dtm / dtl
 │   └── bashrc-netreset.sh       netreset / netstat-paper
 ├── display/monitors.xml         GNOME 显示器配置(双屏,含竖屏旋转)
+├── sudoers/                     cli/gui 切换的免密规则
 └── container/README.md          容器启动脚本位置与改动点
 ```
 
@@ -128,6 +129,13 @@ sudo bash network/scripts/finish-setup.sh         # 开机自启 + 增强版 net
 ```
 
 四个脚本均幂等,可重复执行。shell 片段需手工并入 `~/.bashrc`。
+
+可选:免去 `cli`/`gui` 的 sudo 密码(只放行三条精确命令)
+
+```bash
+sudo install -m 0440 sudoers/gui-cli-switch /etc/sudoers.d/gui-cli-switch
+sudo visudo -c -f /etc/sudoers.d/gui-cli-switch
+```
 
 ## 说明
 

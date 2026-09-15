@@ -1,0 +1,4 @@
+# 允许 descfly 免密切换图形/命令行模式(仅这三条精确命令)
+descfly ALL=(root) NOPASSWD: /usr/bin/systemctl isolate multi-user.target
+descfly ALL=(root) NOPASSWD: /usr/bin/systemctl isolate graphical.target
+descfly ALL=(root) NOPASSWD: /usr/bin/systemctl restart gdm3
