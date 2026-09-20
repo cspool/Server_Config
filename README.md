@@ -49,7 +49,7 @@ gui            # 切回图形
 
 | 层 | 配置 | 避开的坑 |
 |---|---|---|
-| **穿透** | BeyondNetwork edge(host network,`RestartPolicy=always`),本机**不配虚拟 IP**、只宣告 `192.168.10.0/24` 站点子网 | 配虚拟 IP 会让 edge 劫持本机去局域网的流量;子网写成 `/16` 会把远端客户端自己的局域网也吸进隧道 |
+| **穿透** | BeyondNetwork edge(host network + privileged,`RestartPolicy=always`),本机**不配虚拟 IP**、只宣告 `192.168.10.0/24` 站点子网;底层流量用主表 `/32 + onlink` 路由从 **eno2 直出,绕开 mihomo TUN** | 配虚拟 IP 会让 edge 劫持本机去局域网的流量;子网写成 `/16` 会把远端客户端自己的局域网也吸进隧道;**流量若进了 TUN,mihomo 会终结并重发 UDP,NAT 打洞失败 —— 隧道只有保活、`tx` 恒为 0** |
 | **回包** | NetworkManager 持久化的源网段策略路由(规则 199/200 + 独立路由表) | 双网卡各有默认路由 → 请求从 eno2 进、回包从 eno1 出 → 认证超时 |
 | **桌面** | GNOME 桌面共享,端口 **3390**,**关闭端口协商**,停用系统级远程登录 | 端口协商会把客户端重定向到隧道内不可达的端口;3389 上的系统级实例会抢先接管并甩给无凭据的 Handover 进程 |
 
@@ -88,7 +88,8 @@ netstat-paper  # 状态速览
 │   ├── 开发环境指南.md          完整参考:四个入口、分流原理、故障处置
 │   └── tmux实验操作说明.md      操作速查:五步逻辑 + 两个场景
 ├── network/                     VPN 分流栈
-│   ├── scripts/                 ensure-openvpn3 / net-reset / guard / refresh / 4 个安装脚本
+│   ├── scripts/                 启动链脚本(ensure-*)、netstack、refresh、guard、安装脚本
+│   │   └── deprecated/          已证伪的方案,仅作记录
 │   ├── systemd/                 5 个单元文件
 │   └── config/                  配置说明(mihomo 主配置含机场凭据,不入库)
 ├── shell/                       ~/.bashrc 的三个自定义块
