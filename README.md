@@ -99,29 +99,27 @@ netstat-paper  # 状态速览
 
 两道保险:开机不足 15 分钟不重启(防引导循环);两次自动重启至少间隔 2 小时(时间戳落在 `/var/lib/`,跨重启保留)。
 
-**重启之后**:
+**重启之后**(2026-09-22 实测,已更正早先的错误结论):
 
-| 通道 | 是否自动恢复 | 是否要输入密码 |
+| 通道 | 是否自动恢复 | 说明 |
 |---|---|---|
-| SSH | 是 | 否(公钥登录;`ssh.socket` 开机自启,edge 容器 `RestartPolicy=always`) |
-| RDP 3390 | 否 | 是,但可**纯远程**输入 |
+| SSH | 是 | 公钥登录;`ssh.socket` 开机自启,edge 容器 `RestartPolicy=always` |
+| RDP 3390 端口监听 | 是 | 由 `graphical-session.target` 决定,**与登录钥匙环无关** |
+| RDP 登录认证 | **未验证** | grd 在 NLA 阶段要从登录钥匙环读凭据,钥匙环锁定时能否通过没测过 |
 
-RDP 不自动恢复的原因:凭据存在 GNOME 登录钥匙环里,而 GDM 自动登录没有密码可交给 PAM
-(日志:`gkr-pam: couldn't unlock the login keyring`),钥匙环锁着则 `gnome-remote-desktop` 读不到凭据。
-系统级 Remote Login(3389)本可绕开钥匙环,但需要 TPM2,本机无 `/dev/tpm*`。
+日志时序证明监听与钥匙环无关:`17:15:54 gkr-pam: couldn't unlock the login keyring`(锁着)→
+`17:15:58 graphical-session.target` → `17:15:59 RDP server started`(仍锁着,已监听)。
+反向亦成立:执行 `cli` 后 `graphical-session.target` 停止,0.7 秒后 grd 打印 `RDP server stopped`。
+**所以 CLI 模式下 3390 必然不监听,这是设计行为;排查 RDP 不通先确认模式,而不是查钥匙环。**
 
-远程恢复(SSH 进来后执行,密码交互式输入,不落盘):
+> 早先本节曾写"RDP 重启后不会自动恢复,需远程 `gnome-keyring-daemon --unlock` 解锁",**两条都是错的**,
+> 已删除。线级证据:`--unlock` 裸调用一个字节都不发、根本不连已有 daemon;`--replace --unlock` 只发
+> op=3(QUIT),载荷不含密码 —— 该二进制从不把密码经控制套接字交给已运行的 daemon。详见指南。
 
-```bash
-export XDG_RUNTIME_DIR=/run/user/1000
-export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
-read -rs PW && printf '%s' "$PW" | gnome-keyring-daemon --unlock && unset PW
-systemctl --user restart gnome-remote-desktop
-```
-
-可行的依据:在无 `DISPLAY`/`WAYLAND_DISPLAY` 的清空环境下,`gnome-keyring-daemon --start` 输出
-`discover_other_daemon: 1` 并返回已运行 daemon 的控制目录,进程列表无新增 —— 说明非图形上下文
-能通过控制套接字对话到图形会话里的 daemon,而不是另起一个互不相干的实例。
+**启用自动重启前必须先处理的风险**:`/etc/fstab` 中 `/data1`、`/data2`、`/data3` 三条均为 `defaults`、
+**没有 `nofail`**,且 `RequiredBy=local-fs.target`。任一磁盘掉线或 `/data3`(pass=2)开机 fsck 失败,
+系统即进入 `emergency.target`,SSH 与 RDP 全部不可用。另:日志持久化目录虽已建立但尚未生效
+(journal 仍写在 `/run/log/journal`),下次重启仍会丢失现场。两项都需先修。
 
 **代价**:自动重启会丢掉所有 tmux 会话,以及 `RestartPolicy=no` 的容器。
 若希望开发容器随主机回来:`docker update --restart unless-stopped <容器名>`。
