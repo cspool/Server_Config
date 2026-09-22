@@ -15,3 +15,7 @@ docs/.backups/
 # 同名占位空文件除外
 !network/config/*.ovpn
 *.keyring
+
+# Python 字节码缓存
+__pycache__/
+*.pyc

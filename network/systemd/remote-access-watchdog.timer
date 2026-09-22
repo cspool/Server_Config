@@ -1,0 +1,16 @@
+[Unit]
+Description=Run remote-access watchdog periodically (Beyond tunnel + RDP)
+# 独立于 mihomo:RDP 的可用性不该依赖分流栈是否健康
+IgnoreOnIsolate=true
+
+[Timer]
+# 开机后等 10 分钟再首次检查:给 mihomo 启动链(ExecStartPre 建 openvpn3 会话,
+# TimeoutStartSec=240)和 Beyond edge 重连留足时间,避免开机瞬间误判。
+OnBootSec=10min
+# 每 5 分钟扫描一次。
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

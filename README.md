@@ -80,6 +80,52 @@ netstat-paper  # 状态速览
 
 ---
 
+### 5. 断线自愈与无人值守恢复
+
+**问题**:Beyond 隧道偶发断连且不自行恢复,人不在机器跟前就彻底失联;主机重启后远程桌面不会自动回来。
+
+**做法**:一个独立于 mihomo 的开机自启守护 `remote-access-watchdog`,每 5 分钟检查一次,分级升压。
+
+| 级别 | 条件 | 动作 |
+|---|---|---|
+| L1 | edge 容器不在 running | `docker start` |
+| L2 | `utun0` 缺失或无 overlay 路由 | `docker restart edge` |
+| L3 | 容器与网卡都正常,但**无底层 UDP 会话** | `docker restart edge` |
+| L4 | 同上且**连续 20 分钟、4 次重启全部无效** | `systemctl reboot` |
+| RDP | 服务不活或 3390 无监听 | 重启 `gnome-remote-desktop`(**不会重启主机**) |
+
+判据用的是 edge 与 Beyond 节点之间的底层 UDP `ESTAB` 会话,不是 `utun0` 的收发计数 ——
+后者在**对端不在线时本来就不动**,拿它当判据会导致客户端一关机,主机就每 20 分钟自己重启,打断实验。
+
+两道保险:开机不足 15 分钟不重启(防引导循环);两次自动重启至少间隔 2 小时(时间戳落在 `/var/lib/`,跨重启保留)。
+
+**重启之后**:
+
+| 通道 | 是否自动恢复 | 是否要输入密码 |
+|---|---|---|
+| SSH | 是 | 否(公钥登录;`ssh.socket` 开机自启,edge 容器 `RestartPolicy=always`) |
+| RDP 3390 | 否 | 是,但可**纯远程**输入 |
+
+RDP 不自动恢复的原因:凭据存在 GNOME 登录钥匙环里,而 GDM 自动登录没有密码可交给 PAM
+(日志:`gkr-pam: couldn't unlock the login keyring`),钥匙环锁着则 `gnome-remote-desktop` 读不到凭据。
+系统级 Remote Login(3389)本可绕开钥匙环,但需要 TPM2,本机无 `/dev/tpm*`。
+
+远程恢复(SSH 进来后执行,密码交互式输入,不落盘):
+
+```bash
+export XDG_RUNTIME_DIR=/run/user/1000
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+read -rs PW && printf '%s' "$PW" | gnome-keyring-daemon --unlock && unset PW
+systemctl --user restart gnome-remote-desktop
+```
+
+可行的依据:在无 `DISPLAY`/`WAYLAND_DISPLAY` 的清空环境下,`gnome-keyring-daemon --start` 输出
+`discover_other_daemon: 1` 并返回已运行 daemon 的控制目录,进程列表无新增 —— 说明非图形上下文
+能通过控制套接字对话到图形会话里的 daemon,而不是另起一个互不相干的实例。
+
+**代价**:自动重启会丢掉所有 tmux 会话,以及 `RestartPolicy=no` 的容器。
+若希望开发容器随主机回来:`docker update --restart unless-stopped <容器名>`。
+
 ## 目录结构
 
 ```
@@ -87,11 +133,11 @@ netstat-paper  # 状态速览
 ├── docs/
 │   ├── 开发环境指南.md          完整参考:四个入口、分流原理、故障处置
 │   └── tmux实验操作说明.md      操作速查:五步逻辑 + 两个场景
-├── network/                     VPN 分流栈
-│   ├── scripts/                 启动链脚本(ensure-*)、netstack、refresh、guard、安装脚本
+├── network/                     VPN 分流栈 + 远程访问守护
+│   ├── scripts/                 启动链脚本(ensure-*)、netstack、refresh、guard、watchdog、安装脚本
 │   │   └── deprecated/          已证伪的方案,仅作记录
-│   ├── systemd/                 5 个单元文件
-│   └── config/                  配置说明(mihomo 主配置含机场凭据,不入库)
+│   ├── systemd/                 7 个单元文件(mihomo / refresh / guard / watchdog)
+│   └── config/                  配置占位(含机场凭据与 VPN 凭据,均为空文件,不入库)
 ├── shell/                       ~/.bashrc 的三个自定义块
 │   ├── bashrc-cli-gui.sh        cli / gui / guistat
 │   ├── bashrc-container.sh      dls / dsh / dtm / dtl
@@ -112,6 +158,9 @@ netstat-paper  # 状态速览
 | `tmux new -A -s <名>` | 宿主机 tmux(建或接) |
 | `cli` / `gui` / `guistat` | 图形与命令行模式切换、状态查看 |
 | `netreset` / `netstat-paper` | 网络栈四阶段重置、状态速览 |
+| `sudo netstack status\|stop\|start\|restart\|reset\|heal` | 整条分流链的开关与自愈 |
+| `journalctl -u remote-access-watchdog -f` | 实时查看隧道/RDP 守护的动作 |
+| `cat /run/remote-access-watchdog.state` | 当前连续失败轮数(0 表示正常) |
 
 远程入口:
 
@@ -126,10 +175,13 @@ netstat-paper  # 状态速览
 sudo bash network/scripts/install.sh              # headless mihomo
 sudo bash network/scripts/install-chain.sh        # 启动链 openvpn3 → mihomo → guard
 sudo bash network/scripts/install-policy-fix.sh   # 放行规则 + guard 路径 + net-reset
-sudo bash network/scripts/finish-setup.sh         # 开机自启 + 增强版 net-reset
+sudo bash network/scripts/install-beyond-eno2.sh  # Beyond 底层出口走 eno2,绕开 mihomo TUN
+sudo bash network/scripts/install-fix.sh          # 订阅刷新修复 + 启动配置自愈 + netstack
+sudo bash network/scripts/fix-guard-order.sh      # guard 移到启动链最后 + IgnoreOnIsolate
+sudo bash network/scripts/install-watchdog.sh     # 隧道/RDP 守护 + 开启日志持久化
 ```
 
-四个脚本均幂等,可重复执行。shell 片段需手工并入 `~/.bashrc`。
+全部脚本均幂等,可重复执行;顺序如上。shell 片段需手工并入 `~/.bashrc`。
 
 可选:免去 `cli`/`gui` 的 sudo 密码(只放行三条精确命令)
 

@@ -1,0 +1,7 @@
+[Unit]
+Description=Watchdog for Beyond tunnel and RDP (runtime self-heal)
+After=mihomo.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/mihomo/remote-access-watchdog.sh
