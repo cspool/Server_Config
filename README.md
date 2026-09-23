@@ -136,6 +136,7 @@ netstat-paper  # 状态速览
 │   │   └── deprecated/          已证伪的方案,仅作记录
 │   ├── systemd/                 7 个单元文件(mihomo / refresh / guard / watchdog)
 │   └── config/                  配置占位(含机场凭据与 VPN 凭据,均为空文件,不入库)
+├── obsidian/                    Obsidian 常驻服务 + REST 看护(CLI 模式下 MCP 可用)
 ├── shell/                       ~/.bashrc 的三个自定义块
 │   ├── bashrc-cli-gui.sh        cli / gui / guistat
 │   ├── bashrc-container.sh      dls / dsh / dtm / dtl
@@ -159,6 +160,8 @@ netstat-paper  # 状态速览
 | `sudo netstack status\|stop\|start\|restart\|reset\|heal` | 整条分流链的开关与自愈 |
 | `journalctl -u remote-access-watchdog -f` | 实时查看隧道/RDP 守护的动作 |
 | `cat /run/remote-access-watchdog.state` | 当前连续失败轮数(0 表示正常) |
+| `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:27123/` | Obsidian Local REST API 健康检查 |
+| `curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:51361/search?q=x'` | Omnisearch API 健康检查(比 27123 晚就绪) |
 
 远程入口:
 

@@ -1,0 +1,14 @@
+[Unit]
+Description=Restart obsidian.service when the graphical session starts or stops (window <-> headless)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# GUI came up: relaunch with a window. GUI went away: relaunch headless.
+ExecStart=/usr/bin/systemctl --user --no-block restart obsidian.service
+ExecStop=/usr/bin/systemctl --user --no-block restart obsidian.service
+
+[Install]
+WantedBy=graphical-session.target

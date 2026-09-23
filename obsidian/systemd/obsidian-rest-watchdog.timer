@@ -1,0 +1,11 @@
+[Unit]
+Description=Probe the Obsidian Local REST API every 60s and restart obsidian.service if it is down (180s 启动宽限期见 service)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=60s
+AccuracySec=15s
+Unit=obsidian-rest-watchdog.service
+
+[Install]
+WantedBy=timers.target

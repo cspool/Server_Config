@@ -1,0 +1,25 @@
+[Unit]
+Description=Restart obsidian.service when its Local REST API stops answering (renderer crash leaves the main process alive)
+After=obsidian.service
+
+[Service]
+Type=oneshot
+# 启动宽限期(GRACE):obsidian.service 启动不足 180 秒时一律不动它。
+#   Obsidian 冷启动要加载插件并重建 Omnisearch 的 BM25 索引,27123 在此期间可能
+#   还不应答。没有宽限期时 watchdog 会把正在启动的 Obsidian 再掐一次,形成循环。
+# 探测两次、相隔 10 秒,只有两次都失败才重启,避免一次慢查询触发重启。
+# 51361(Omnisearch HTTP API)只记录不作为重启依据:它比 27123 晚就绪,
+#   若拿它当重启条件,会在索引重建期间反复重启。
+ExecStart=/bin/sh -c 'GRACE=180; \
+  ts=$(systemctl --user show obsidian.service -p ActiveEnterTimestampMonotonic --value 2>/dev/null); \
+  now=$(awk "{printf \\"%%d\\", \\$1*1000000}" /proc/uptime); \
+  [ -n "$ts" ] && [ "$ts" -gt 0 ] && [ $(( (now - ts) / 1000000 )) -lt "$GRACE" ] && \
+    { echo "obsidian 启动不足 ${GRACE}s,跳过探测"; exit 0; }; \
+  probe() { curl -s -m 8 -o /dev/null -w "%%{http_code}" http://127.0.0.1:27123/ 2>/dev/null; }; \
+  om() { curl -s -m 8 -o /dev/null -w "%%{http_code}" "http://127.0.0.1:51361/search?q=healthcheck" 2>/dev/null; }; \
+  a=$(probe); \
+  if [ "$a" = "200" ]; then o=$(om); [ "$o" = "200" ] || echo "注意:27123 正常但 Omnisearch 51361 返回 $o(索引可能仍在重建,不触发重启)"; exit 0; fi; \
+  sleep 10; b=$(probe); \
+  if [ "$b" = "200" ]; then exit 0; fi; \
+  echo "obsidian REST down (probes: $a/$b) - restarting obsidian.service"; \
+  systemctl --user restart obsidian.service'

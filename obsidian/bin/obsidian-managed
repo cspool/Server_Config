@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Launch Obsidian for obsidian.service in the right mode:
+#   - a graphical session is active  -> normal window on that display
+#   - no graphical session (CLI/SSH) -> Chromium ozone headless, no X needed
+# The Local REST API plugin (127.0.0.1:27123/27124) works identically in both,
+# so the obsidian MCP server never notices the difference.
+set -u
+APP="${OBSIDIAN_APPIMAGE:-$HOME/Applications/Obsidian.AppImage}"
+# --no-sandbox: Ubuntu's apparmor_restrict_unprivileged_userns=1 makes the
+# Chromium SUID sandbox abort when the AppImage is started outside the desktop.
+# --js-flags: Omnisearch keeps its BM25 index in the renderer V8 heap. With this
+# vault (150+ MB of indexed markdown) two concurrent MCP search agents, each
+# pulling multi-MB responses, exhausted the default heap and killed the renderer
+# while systemd still saw the main process alive.
+#
+# 2026-09-22 记录:12288 MB 仍然不够 —— 渲染进程触发了全局 OOM
+#   kernel: V8Worker invoked oom-killer ... global_oom
+#   systemd: obsidian.service: Failed with result 'oom-kill'
+# 每次 OOM 后 Restart=always 重启,而 Omnisearch 的 51361 端口比 27123 晚就绪,
+# 于是调用方在那个窗口里拿到 ERROR —— 表现为"时不时 error、时不时 OK"。
+# 本机 251 GB 物理内存、常态可用 230 GB 以上,故放宽到 32 GB。
+# 注意 obsidian.service 带 OOMScoreAdjust=200:真到内存紧张时内核会优先杀
+# Obsidian 而不是实验进程,这是有意的取舍(Obsidian 可自动重启,实验不可)。
+COMMON=(--no-sandbox --js-flags="--max-old-space-size=32768")
+
+gui_available() {
+  [ "${OBSIDIAN_FORCE_HEADLESS:-0}" = "1" ] && return 1
+  systemctl --user -q is-active graphical-session.target || return 1
+  if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/${WAYLAND_DISPLAY}" ]; then
+    return 0
+  fi
+  if [ -n "${DISPLAY:-}" ] && [ -S "/tmp/.X11-unix/X${DISPLAY#:}" ]; then
+    return 0
+  fi
+  return 1
+}
+
+if gui_available; then
+  echo "obsidian-managed: graphical session active, starting with a window (DISPLAY=${DISPLAY:-} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-})"
+  exec "$APP" "${COMMON[@]}"
+else
+  echo "obsidian-managed: no graphical session, starting headless"
+  unset DISPLAY WAYLAND_DISPLAY XAUTHORITY
+  exec "$APP" "${COMMON[@]}" --ozone-platform=headless --disable-gpu
+fi

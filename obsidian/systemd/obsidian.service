@@ -1,0 +1,18 @@
+[Unit]
+Description=Obsidian (Local REST API for the obsidian MCP) - always on, window when a GUI session exists, headless otherwise
+# Never give up restarting.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Picks window vs headless mode; see the script for details.
+ExecStart=%h/.local/bin/obsidian-managed
+# Restart on clean quit, crash, kill, or display loss.
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+# Start at user-manager login (also at boot when lingering is enabled).
+WantedBy=default.target
