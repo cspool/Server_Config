@@ -74,3 +74,63 @@ ensure_tmux() {
 
 同步后已校验:两份逐文件一致;模板中的 tmux 段落与三个线上启动器
 (`MLX_dev` / `AgentSys` / `GPDPU`)逐字相同。
+
+## 2026-09-24 的修复:tmux 里丢失 bypass 模式
+
+新建的 `SWHWyard_dev` 容器里直接输入 `claude` 没有进入 bypass 模式。
+
+**根因**:容器内的 bypass 是靠 `~/.bashrc` 里的 alias 实现的
+
+```bash
+_claude_with_host_permissions() { command claude --dangerously-skip-permissions "$@"; ... }
+alias claude='_claude_with_host_permissions'
+```
+
+而 alias 只对**交互式非登录** shell 生效。**登录** shell 按顺序读
+`~/.bash_profile` → `~/.bash_login` → `~/.profile`,**不读 `~/.bashrc`**;
+而启动器播种的容器私有 home 里这三个文件一个都没有。`tmux` 起的正是登录 shell,
+所以 SKILL.md 第 13 条推荐的 `docker exec -it <c> tmux new-session -A -s work`
+反而会**静默丢掉 bypass** —— 同一个 `claude`,在 `docker exec -it … bash` 里有,
+在 tmux 里没有。
+
+实测(修复前,`SWHWyard_dev`):
+
+| 入口 | alias |
+|---|---|
+| `bash -i` | ✓ 存在 |
+| `bash -l` | ✗ 缺失 |
+| `bash -li` | ✗ 缺失 |
+| tmux 会话 | ✗ 缺失 |
+
+**处置**:启动器新增 `write_container_user_profile`,在容器 home 写一个 `.profile`
+把两条链接起来:
+
+```bash
+if [ -n "$BASH_VERSION" ] && [ -f "$HOME/.bashrc" ]; then
+  . "$HOME/.bashrc"
+fi
+```
+
+改动落在 5 个文件:模板 + 四个线上启动器(`MLX_dev`、`AgentSys`、`GPDPU`、`SWHWyard`),
+各自备份为 `*.bak.profile-<时间戳>`,全部 `bash -n` 通过。两份 SKILL.md 的第 8 条
+也一并改写:明确"容器默认 bypass 是与宿主机有意不同的行为",并说明必须同时写
+`.profile`,否则第 13 条的 tmux 工作流会与第 8 条互相矛盾。
+
+修复后验证矩阵:
+
+| 容器 | `bash -i` | `bash -l` | tmux |
+|---|---|---|---|
+| SWHWyard_dev | ✓ | ✓ | ✓ |
+| MLX_chipyard_dev | ✓ | ✓ | ✓ |
+| AgentSys_dev | ✓ | ✓ | ✓ |
+| GPDPU_dev | (exited,下次启动时由启动器生成) | | |
+
+非交互 shell(`bash -c`、脚本)仍然不带 alias —— 这是正确的,脚本不应受 alias 影响。
+
+自检命令:
+
+```bash
+docker exec -i <container> bash -l -c 'alias claude'   # 应输出 _claude_with_host_permissions
+docker exec -i <container> bash -i -c 'alias claude'
+```
+
