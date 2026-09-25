@@ -50,7 +50,7 @@ gui            # 切回图形
 | 层 | 配置 | 避开的坑 |
 |---|---|---|
 | **穿透** | BeyondNetwork edge(host network + privileged,`RestartPolicy=always`),本机**不配虚拟 IP**、只宣告站点子网(当前 `192.168.31.0/24`);底层流量用主表 `/32` 路由从**指定网卡直出,绕开 mihomo TUN**(网卡写在 `/etc/mihomo/beyond.conf`,当前 `eno1`) | 配虚拟 IP 会让 edge 劫持本机去局域网的流量;子网写成 `/16` 会把远端客户端自己的局域网也吸进隧道;**流量若进了 TUN,mihomo 会终结并重发 UDP,NAT 打洞失败 —— 隧道只有保活、`tx` 恒为 0** |
-| **回包** | NetworkManager 持久化的源网段策略路由(规则 199/200 + 独立路由表) | 双网卡各有默认路由 → 请求从 eno2 进、回包从 eno1 出 → 认证超时 |
+| **回包** | 全机只依赖 `eno1`,**eno2 已禁用** | 曾因双网卡各有默认路由导致请求从 eno2 进、回包从 eno1 出 → 认证超时;现单网卡不再有此问题 |
 | **桌面** | GNOME 桌面共享,端口 **3390**,**关闭端口协商**,停用系统级远程登录 | 端口协商会把客户端重定向到隧道内不可达的端口;3389 上的系统级实例会抢先接管并甩给无凭据的 Handover 进程 |
 
 **效果**:远端直接连 `192.168.31.116:3390`(桌面)或 `ssh descfly@192.168.31.116`(CLI),
@@ -177,6 +177,7 @@ sudo bash network/scripts/install.sh              # headless mihomo
 sudo bash network/scripts/install-chain.sh        # 启动链 openvpn3 → mihomo → guard
 sudo bash network/scripts/install-policy-fix.sh   # 放行规则 + guard 路径 + net-reset
 sudo bash network/scripts/install-beyond-underlay.sh  # Beyond 底层出口(网卡由 beyond.conf 决定),绕开 mihomo TUN
+sudo bash network/scripts/disable-eno2.sh         # 禁用 eno2(校园网劫持源),全机只依赖 eno1
 sudo bash network/scripts/install-fix.sh          # 订阅刷新修复 + 启动配置自愈 + netstack
 sudo bash network/scripts/fix-guard-order.sh      # guard 移到启动链最后 + IgnoreOnIsolate
 sudo bash network/scripts/install-watchdog.sh     # 隧道/RDP 守护 + 开启日志持久化
@@ -196,6 +197,13 @@ sudo visudo -c -f /etc/sudoers.d/gui-cli-switch
 - `network/config/config.yaml` 含机场节点凭据,**不入库**。从 Clash 客户端导出后放到 `/etc/mihomo/config.yaml` 即可。
 - 文档中的 RDP 密码已打码,本机用 `grdctl status --show-credentials` 查看。
 - 远程桌面使用 GNOME Remote Desktop 的桌面共享模式;系统级远程登录需要 TPM,本机(Supermicro X12DAi-N6)无 TPM,故未启用。
+- **eno2 已禁用**(2026-09-25),全机只依赖 `eno1`。eno2 接的是校园网,认证过期后上游用自签
+  证书**透明劫持 HTTPS** —— 曾导致 Beyond edge 拿到认证跳转 HTML 而非 JSON、隧道整体不可用,
+  而所有网络层检查都显示"正常",极难定位。该账号处于「免费区域」无外网额度,重新认证也无济于事。
+  禁用方式(`network/scripts/disable-eno2.sh`)保留了连接配置,一条命令可回切;
+  需要校园网时的认证方法见指南「为什么禁用 eno2」一节。
+- `network/config/beyond.conf` 的 `BEYOND_IFACE` 决定 Beyond 底层出口网卡(当前 `eno1`),
+  源地址、网关、是否需要 `onlink` 均自动推导 —— 换网卡只改这一行。
 
 ## 环境
 
