@@ -16,7 +16,7 @@ fi
 sed -i 's|^#\?Storage=.*|Storage=persistent|' /etc/systemd/journald.conf
 grep -q '^SystemMaxUse=' /etc/systemd/journald.conf || sed -i '/^\[Journal\]/a SystemMaxUse=500M' /etc/systemd/journald.conf
 systemctl restart systemd-journald
-echo "  Storage=$(grep -E '^Storage=' /etc/systemd/journald.conf)  上限=$(grep -E '^SystemMaxUse=' /etc/systemd/journald.conf)"
+echo "  $(grep -E "^Storage=" /etc/systemd/journald.conf)  上限=$(grep -E "^SystemMaxUse=" /etc/systemd/journald.conf)"
 
 echo "[2/5] 部署 watchdog"
 install -m 0755 "$SRC/remote-access-watchdog.sh" /etc/mihomo/remote-access-watchdog.sh
