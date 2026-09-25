@@ -2,13 +2,17 @@
 """把 Beyond 的域名排除出 fake-ip,让 edge 拿到真实 IP。
 
 否则 edge 解析 api1.beyondnetwork.cn 得到 28.0.0.x 假 IP,拿着假 IP 去连
-→ 进 TUN,ensure-beyond-eno2.sh 装的 /32 路由匹配不上,控制面仍被 mihomo 中转。
+→ 进 TUN,ensure-beyond-underlay.sh 装的 /32 路由匹配不上,控制面仍被 mihomo 中转。
 与当初修 openvpn3 握手(+.<VPN域名>)是同一手法。
 """
 import sys, yaml, subprocess
 
 CFG = "/etc/mihomo/config.yaml"
-DOMAINS = ["+.beyondnetwork.cn", "+.beyondtunnel.com", "+.ipw.cn"]
+# 2026-09-25:漏了 .net —— edge 实际连的是 dash.beyondnetwork.net,
+# 被解析成 fake-ip 28.0.0.4 → 注册失败 → utun0 拿不到 overlay 地址
+# → 远端 SSH/RDP 进不来(路由在、地址没有,极易误判为"隧道正常")。
+DOMAINS = ["+.beyondnetwork.cn", "+.beyondnetwork.net", "+.beyondtunnel.com",
+           "+.beyondtunnel.cn", "+.ipw.cn"]
 
 cfg = yaml.safe_load(open(CFG))
 filt = cfg.setdefault("dns", {}).get("fake-ip-filter") or []

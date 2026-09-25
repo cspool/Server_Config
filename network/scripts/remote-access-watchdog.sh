@@ -16,7 +16,10 @@ set -uo pipefail
 
 EDGE=beyondnetwork_edge
 GUI_USER=descfly
-NODES_FILE=/run/beyond-eno2.routes          # ensure-beyond-eno2.sh 写的节点清单
+# 节点清单由 ensure-beyond-underlay.sh 写入。新路径优先,旧路径兼容
+# (2026-09-25 底层出口由 eno2 迁到 eno1 时改名,文件名不再绑定网卡)。
+NODES_FILE=/run/beyond-underlay.routes
+[ -r "$NODES_FILE" ] || NODES_FILE=/run/beyond-eno2.routes
 STATE=/run/remote-access-watchdog.state     # 本次开机的连续失败计数
 COOLDOWN=/var/lib/remote-access-watchdog.reboot   # 跨重启的冷却标记
 RDP_CLI_MARK=/run/remote-access-watchdog.cli-mode  # CLI 模式已记录过一行的标记

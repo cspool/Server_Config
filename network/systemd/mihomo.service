@@ -11,7 +11,7 @@ ExecStartPre=/etc/mihomo/ensure-config.sh
 # 2) mihomo 本体(TUN + 全局路由拦截 + 分流)
 ExecStart=/usr/bin/verge-mihomo -d /etc/mihomo -f /etc/mihomo/config.yaml
 # 3) mihomo 就绪后再拉起路由守护(guard 已取消开机自启, 只由 mihomo 拉起)
-ExecStartPost=/etc/mihomo/ensure-beyond-eno2.sh
+ExecStartPost=/etc/mihomo/ensure-beyond-underlay.sh
 ExecStartPost=/etc/mihomo/ensure-remote-access.sh
 ExecStartPost=/usr/bin/systemctl --no-block start claude-vpn-guard.timer
 # 停止 mihomo 时一并停掉 guard, 否则它会把全部流量兜底进 openvpn3

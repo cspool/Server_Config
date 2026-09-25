@@ -61,8 +61,8 @@
 |---|---|
 | 本地 GUI | 桌面开 Terminal |
 | 本地 CLI | `Ctrl+Alt+F3` → TTY 登录 |
-| 远程 GUI | Windows App → `192.168.10.86:3390`(descfly / <RDP密码>)→ 里面开 Terminal |
-| 远程 CLI | `ssh descfly@192.168.10.86` |
+| 远程 GUI | Windows App → `192.168.31.116:3390`(descfly / <RDP密码>)→ 里面开 Terminal |
+| 远程 CLI | `ssh descfly@192.168.31.116` |
 
 **四个入口之后,命令完全相同** —— 这就是入口透明。
 
@@ -108,13 +108,13 @@
 **远程**(RDP 看文档 + SSH 跑实验,并行,不切 CLI):
 
 ```bash
-ssh descfly@192.168.10.86
+ssh descfly@192.168.31.116
 dtm MLX_chipyard_dev          # 容器里跑实验
 python train.py
 # Ctrl+b d                     # 脱离
 exit                           # 退出 SSH,实验继续跑
 ```
-同时 Windows App 连 `192.168.10.86:3390` 看文档。两条链路独立,互不影响。
+同时 Windows App 连 `192.168.31.116:3390` 看文档。两条链路独立,互不影响。
 
 **本地**(随时切换):
 

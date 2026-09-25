@@ -101,9 +101,7 @@ def main():
 
     # 3b. 按地区正则重建组成员 —— prune 只做减法,没有这一步组会永久退化成
     #     仅剩 DIRECT(2026-09-25 的 github 不通就是这样来的)。
-    nrb, notes = rebuild(cfg)
-    for line in notes:
-        log(line)
+    nrb = rebuild(cfg, log=lambda m: log(m))
     log(f"重建分组 {nrb} 个")
 
     # 4. 写临时文件并校验 —— 不通过绝不落地

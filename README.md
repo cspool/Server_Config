@@ -49,11 +49,11 @@ gui            # 切回图形
 
 | 层 | 配置 | 避开的坑 |
 |---|---|---|
-| **穿透** | BeyondNetwork edge(host network + privileged,`RestartPolicy=always`),本机**不配虚拟 IP**、只宣告 `192.168.10.0/24` 站点子网;底层流量用主表 `/32 + onlink` 路由从 **eno2 直出,绕开 mihomo TUN** | 配虚拟 IP 会让 edge 劫持本机去局域网的流量;子网写成 `/16` 会把远端客户端自己的局域网也吸进隧道;**流量若进了 TUN,mihomo 会终结并重发 UDP,NAT 打洞失败 —— 隧道只有保活、`tx` 恒为 0** |
+| **穿透** | BeyondNetwork edge(host network + privileged,`RestartPolicy=always`),本机**不配虚拟 IP**、只宣告站点子网(当前 `192.168.31.0/24`);底层流量用主表 `/32` 路由从**指定网卡直出,绕开 mihomo TUN**(网卡写在 `/etc/mihomo/beyond.conf`,当前 `eno1`) | 配虚拟 IP 会让 edge 劫持本机去局域网的流量;子网写成 `/16` 会把远端客户端自己的局域网也吸进隧道;**流量若进了 TUN,mihomo 会终结并重发 UDP,NAT 打洞失败 —— 隧道只有保活、`tx` 恒为 0** |
 | **回包** | NetworkManager 持久化的源网段策略路由(规则 199/200 + 独立路由表) | 双网卡各有默认路由 → 请求从 eno2 进、回包从 eno1 出 → 认证超时 |
 | **桌面** | GNOME 桌面共享,端口 **3390**,**关闭端口协商**,停用系统级远程登录 | 端口协商会把客户端重定向到隧道内不可达的端口;3389 上的系统级实例会抢先接管并甩给无凭据的 Handover 进程 |
 
-**效果**:远端直接连 `192.168.10.86:3390`(桌面)或 `ssh descfly@192.168.10.86`(CLI),
+**效果**:远端直接连 `192.168.31.116:3390`(桌面)或 `ssh descfly@192.168.31.116`(CLI),
 P2P 直连 RTT ≈ 25 ms。远程桌面用镜像主屏模式,**不新建虚拟屏,本机双屏布局(含竖屏)不受扰动**。
 
 ### 4. VPN 按域名分流,开机自愈
@@ -167,8 +167,8 @@ netstat-paper  # 状态速览
 
 | 用途 | 地址 |
 |---|---|
-| 远程桌面 | `192.168.10.86:3390`(端口必须写) |
-| 远程 CLI | `ssh descfly@192.168.10.86` |
+| 远程桌面 | `192.168.31.116:3390`(端口必须写) |
+| 远程 CLI | `ssh descfly@192.168.31.116` |
 
 ## 部署
 
@@ -176,7 +176,7 @@ netstat-paper  # 状态速览
 sudo bash network/scripts/install.sh              # headless mihomo
 sudo bash network/scripts/install-chain.sh        # 启动链 openvpn3 → mihomo → guard
 sudo bash network/scripts/install-policy-fix.sh   # 放行规则 + guard 路径 + net-reset
-sudo bash network/scripts/install-beyond-eno2.sh  # Beyond 底层出口走 eno2,绕开 mihomo TUN
+sudo bash network/scripts/install-beyond-underlay.sh  # Beyond 底层出口(网卡由 beyond.conf 决定),绕开 mihomo TUN
 sudo bash network/scripts/install-fix.sh          # 订阅刷新修复 + 启动配置自愈 + netstack
 sudo bash network/scripts/fix-guard-order.sh      # guard 移到启动链最后 + IgnoreOnIsolate
 sudo bash network/scripts/install-watchdog.sh     # 隧道/RDP 守护 + 开启日志持久化
