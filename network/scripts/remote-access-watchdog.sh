@@ -19,6 +19,7 @@ GUI_USER=descfly
 NODES_FILE=/run/beyond-eno2.routes          # ensure-beyond-eno2.sh 写的节点清单
 STATE=/run/remote-access-watchdog.state     # 本次开机的连续失败计数
 COOLDOWN=/var/lib/remote-access-watchdog.reboot   # 跨重启的冷却标记
+RDP_CLI_MARK=/run/remote-access-watchdog.cli-mode  # CLI 模式已记录过一行的标记
 
 L3_ROUNDS=1          # 1 轮 × 5 分钟 = 5 分钟:重启容器
 L4_ROUNDS=5          # 第5轮触发:首次发现后已连续尝试 4×5=20 分钟
@@ -92,17 +93,40 @@ else
 fi
 
 # ───── RDP(独立于隧道) ─────
+# 前置门禁:3390 是否监听由 graphical-session.target 是否存在决定,与钥匙环无关。
+#   CLI 模式(systemctl isolate multi-user.target)下 GNOME 会话被拆除,
+#   gnome-remote-desktop 打印 "RDP server stopped",3390 必然不监听 —— 这是
+#   设计行为,不是故障。
+# 2026-09-23 23:44 到 2026-09-25 09:34 的教训:旧版只检查"用户有登录会话",
+#   而 CLI 模式下 pts 会话仍在,门禁形同虚设,于是连续误判 1952 次、
+#   徒劳重启 gnome-remote-desktop 1952 次、写了 3906 行日志,持续 34 小时。
 uid="$(id -u "$GUI_USER" 2>/dev/null)" || exit 0
-if [ -d "/run/user/$uid" ] && loginctl list-sessions --no-legend 2>/dev/null \
-   | awk -v u="$GUI_USER" '$3==u || $4==u {f=1} END{exit !f}'; then
-    act="$(runuser -u "$GUI_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
-           systemctl --user is-active gnome-remote-desktop 2>/dev/null)"
-    port="$(ss -ltn | grep -c ':3390 ')"
-    if [ "$act" != active ] || [ "$port" -eq 0 ]; then
-        log "RDP 异常(服务 $act,3390 监听 $port)→ 重启"
-        runuser -u "$GUI_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
-            systemctl --user restart gnome-remote-desktop >/dev/null 2>&1
-        sleep 2; log "重启后 3390 监听数: $(ss -ltn | grep -c ':3390 ')"
+[ -d "/run/user/$uid" ] || exit 0
+
+gui_session_active() {
+    runuser -u "$GUI_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+        systemctl --user -q is-active graphical-session.target 2>/dev/null
+}
+
+if ! gui_session_active; then
+    # CLI 模式:什么都不做。首次进入时记一行,之后保持静默,避免刷日志。
+    if [ ! -f "$RDP_CLI_MARK" ]; then
+        : > "$RDP_CLI_MARK"
+        log "当前为 CLI 模式(无 graphical-session)→ 3390 不监听属正常,跳过 RDP 检查"
     fi
+    exit 0
+fi
+# 回到 GUI 模式:清掉标记,以便下次进入 CLI 时仍会记录一行。
+[ -f "$RDP_CLI_MARK" ] && rm -f "$RDP_CLI_MARK"
+
+act="$(runuser -u "$GUI_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+       systemctl --user is-active gnome-remote-desktop 2>/dev/null)"
+port="$(ss -ltn | grep -c ':3390 ')"
+if [ "$act" != active ] || [ "$port" -eq 0 ]; then
+    log "RDP 异常(GUI 会话在,服务 $act,3390 监听 $port)→ 重启"
+    runuser -u "$GUI_USER" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+        systemctl --user restart gnome-remote-desktop >/dev/null 2>&1
+    sleep 2; log "重启后 3390 监听数: $(ss -ltn | grep -c ':3390 ')"
 fi
 exit 0

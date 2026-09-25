@@ -21,10 +21,32 @@ ok()  { "$BIN" -d /etc/mihomo -f "$1" -t >/dev/null 2>&1; }
 
 [ -r "$CFG" ] || { log "配置不存在: $CFG"; exit 0; }
 
+# 健康检查:能解析 != 能用。若 Proxy / 地区组退化成只剩 DIRECT,
+# 走这些组的规则会静默直连。这种配置绝不能被存成 known-good 快照,
+# 否则坏状态会被固化、连回滚都救不回来(2026-09-25 实际发生过)。
+healthy() {
+    python3 - "$1" <<'PYEOF' 2>/dev/null
+import sys, os, yaml
+sys.path.insert(0, "/etc/mihomo")
+try:
+    from mihomo_groups import group_health
+except Exception:
+    sys.exit(0)                      # 模块缺失时不阻断,退回旧行为
+bad = group_health(yaml.safe_load(open(sys.argv[1])))
+if bad:
+    print(",".join(bad)); sys.exit(1)
+PYEOF
+}
+
 # ① 直接可用
 if ok "$CFG"; then
     log "配置校验通过"
-    cp -a "$CFG" "$GOOD" 2>/dev/null && log "已更新 known-good 快照"
+    if bad="$(healthy "$CFG")"; then
+        cp -a "$CFG" "$GOOD" 2>/dev/null && log "已更新 known-good 快照"
+    else
+        log "⚠ 配置能解析,但这些组已退化成只剩 DIRECT:${bad:-未知}"
+        log "  → 不更新 known-good 快照(避免固化坏状态);请跑一次 mihomo-refresh 重建分组"
+    fi
     exit 0
 fi
 
@@ -37,8 +59,12 @@ if [ -x "$PRUNE" ] || [ -r "$PRUNE" ]; then
     if python3 "$PRUNE" "$CFG" "$TMP" 2>&1 | sed 's/^/  /' && ok "$TMP"; then
         cp -a "$CFG" "${CFG}.broken.$(date +%Y%m%d-%H%M%S)"
         install -m 0644 "$TMP" "$CFG"
-        cp -a "$CFG" "$GOOD" 2>/dev/null
-        log "✓ 已剔除悬空引用并修复,快照已更新"
+        if bad="$(healthy "$CFG")"; then
+            cp -a "$CFG" "$GOOD" 2>/dev/null
+            log "✓ 已剔除悬空引用并修复,快照已更新"
+        else
+            log "✓ 已剔除悬空引用并修复,但组仍退化:${bad:-未知} → 不更新快照"
+        fi
         exit 0
     fi
     log "剔除悬空引用后仍无法解析"

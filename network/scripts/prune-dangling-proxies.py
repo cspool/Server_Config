@@ -7,7 +7,9 @@
   prune-dangling-proxies.py <输入配置> [输出配置]     省略输出则原地修改
 退出码: 0=有改动或无需改动, 2=读取/解析失败
 """
-import sys, yaml
+import sys, os, yaml
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mihomo_groups import rebuild
 
 BUILTIN = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL"}
 
@@ -51,8 +53,14 @@ def main():
     if len(kept) != len(rules):
         cfg["rules"] = kept
 
-    if not removed:
-        print("[prune] 无悬空引用"); return 0
+    # 剔除只做减法,组会退化成只剩 DIRECT。这里补一次按地区正则的重建,
+    # 把仍然存在的节点填回聚合型组(不依赖固定节点名)。
+    rebuilt = rebuild(cfg, log=lambda m: print("[prune]" + m))
+    if rebuilt:
+        print(f"[prune] 重建分组 {rebuilt} 个")
+
+    if not removed and not rebuilt:
+        print("[prune] 无悬空引用,分组也无需重建"); return 0
 
     for gn, d in removed:
         print(f"[prune] 移除 [{gn}] ← {d}")

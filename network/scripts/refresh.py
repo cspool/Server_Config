@@ -7,9 +7,18 @@
 2026-09-20 修复:此前只替换 proxies 而不管 proxy-groups 按名字的引用。
 订阅更新后节点改名/下线会让引用悬空,整份配置解析失败 → mihomo 陷入
 crash loop(实际发生过 212 次重启)。现在加了剔除 + 校验 + 回滚三道闸。
+
+2026-09-25 修复:上一版的 prune 只做减法。机场改名后所有旧引用被剔除,
+组被填成 ["DIRECT"] 占位,而没有任何环节把新节点填回去 —— 于是 Proxy 组
+长期只剩 DIRECT,所有走 Proxy 的规则实际在直连(github.com 因此不通,
+而 api.github.com 走 OpenAI 组反而正常)。现在增加 rebuild:每次刷新都按
+**地区正则**重建组成员,不依赖任何固定节点名,机场随意改名也能跟上。
 """
 import os, subprocess, sys, urllib.request, shutil, datetime, tempfile
 import yaml
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mihomo_groups import rebuild, group_health
 
 BASE   = "/etc/mihomo/config.yaml"
 GOOD   = "/etc/mihomo/config.good.yaml"
@@ -90,6 +99,13 @@ def main():
     pruned = prune(cfg)
     log(f"剔除悬空引用 {pruned} 处")
 
+    # 3b. 按地区正则重建组成员 —— prune 只做减法,没有这一步组会永久退化成
+    #     仅剩 DIRECT(2026-09-25 的 github 不通就是这样来的)。
+    nrb, notes = rebuild(cfg)
+    for line in notes:
+        log(line)
+    log(f"重建分组 {nrb} 个")
+
     # 4. 写临时文件并校验 —— 不通过绝不落地
     fd, tmp = tempfile.mkstemp(dir="/etc/mihomo", prefix=".config.new.")
     os.close(fd)
@@ -101,6 +117,13 @@ def main():
             log(f"✗ 新配置校验失败,已放弃刷新,保留现有配置: {msg[0][:120]}")
             return 1
         log("✓ 新配置校验通过")
+
+        # 健康门禁:能解析 != 能用。若聚合型组退化成只剩 DIRECT,
+        # 所有走该组的规则会静默直连(2026-09-25 的 github 不通就是这样)。
+        bad = group_health(cfg)
+        if bad:
+            log(f"✗ 组退化(只剩 DIRECT):{bad} —— 放弃刷新,保留现有配置")
+            return 1
 
         # 5. 备份 → 替换 → 存 known-good 快照
         shutil.copy2(BASE, BASE + ".bak." +
