@@ -9,8 +9,9 @@
 # 分级升压(每轮 5 分钟,由 timer 的 OnUnitActiveSec 决定):
 #   L1  容器不在 running                → docker start
 #   L2  utun0 缺失 / 无 overlay 路由     → docker restart edge
-#   L3  无底层会话,连续 1 轮(5 分钟) → 重启 edge 容器
-#   L4  无底层会话,连续 5 轮(首次发现后持续 20 分钟自愈无效) → reboot
+#   L3  隧道判据失败,连续 1 轮(5 分钟) → 重启 edge 容器
+#   L4  隧道判据失败,连续 5 轮(首次发现后持续 20 分钟自愈无效) → reboot
+#       (带 sysrq 强制兜底,防优雅重启被卡住的单元拖住)
 #   RDP 独立检查:GRD 不活 / 3390 不监听 → 重启 gnome-remote-desktop
 set -uo pipefail
 
@@ -31,13 +32,52 @@ COOLDOWN_SEC=7200    # 两次自动重启至少间隔 2 小时
 
 log() { printf '[remote-access-watchdog] %s\n' "$*"; }
 
-# 隧道是否已建立:edge 进程与任一 Beyond 节点有 UDP ESTAB
-tunnel_up() {
-    local nodes
+# ───── 隧道健康判据(2026-09-25 重做)─────
+#
+# 旧判据只看「edge 与任一节点有 UDP :3005 ESTAB」。它在 2026-09-25 的事故里
+# 被完整骗过 34 小时:校园网认证劫持导致 edge 拿不到节点配置、隧道从未建立,
+# 但那条 UDP 保活会话一直 ESTAB,判据始终满足 → 一次都没报警、更没升级到重启。
+#
+# 现在用三个独立信号,**都不依赖远端对端是否在线**(这是旧设计正确的那一半:
+# 不能用 utun0 的 rx/tx 增长,对端一关机它本来就不动,会导致每 20 分钟自重启)。
+#
+#   ① 控制通道:edge 与节点的 TCP :30004 至少一条 ESTAB
+#      健康期 4 条;劫持期全部 SYN-SENT(0 条 ESTAB)—— 正是旧判据的盲区
+#   ② edge 自身无新报错:/var/log/edge.log 的 [E] 行数不再增长
+#      劫持期每 10 秒一条 `invalid character '<'`
+#   ③ utun0 存在且有 overlay 路由(原有的 L2 检查,保留)
+#
+# 判定:① 与 ② 都通过才算隧道健康。任一失败即计数。
+
+ERRCNT=/run/remote-access-watchdog.errcount   # 上次看到的 edge [E] 行数
+
+# ① 控制通道
+control_plane_up() {
+    local nodes n
     nodes="$(sed 's|/32||' "$NODES_FILE" 2>/dev/null | paste -sd'|' -)"
     [ -n "$nodes" ] || nodes='8\.156\.|47\.94\.|139\.196\.|42\.240\.'
-    docker exec "$EDGE" sh -c 'ss -unap 2>/dev/null' 2>/dev/null \
-        | grep -E 'ESTAB' | grep -E "$nodes" | grep -q 'edge'
+    n=$(docker exec "$EDGE" sh -c 'ss -tnap 2>/dev/null' 2>/dev/null \
+        | grep -E 'ESTAB' | grep -E ':30004' | grep -cE "$nodes")
+    [ "${n:-0}" -ge 1 ]
+}
+
+# ② edge 是否在持续报错(用行数增量,避免解析时间戳与时区)
+edge_erroring() {
+    local cur prev
+    cur=$(docker exec "$EDGE" sh -c "grep -c '\\[E\\]' /var/log/edge.log 2>/dev/null" 2>/dev/null | tr -d '\r')
+    case "$cur" in ''|*[!0-9]*) return 1 ;; esac      # 读不到就不判错
+    prev=$(cat "$ERRCNT" 2>/dev/null); case "$prev" in ''|*[!0-9]*) prev=$cur ;; esac
+    echo "$cur" > "$ERRCNT"
+    [ "$cur" -gt "$prev" ]
+}
+
+tunnel_up() {
+    control_plane_up || { log "  判据①失败:无 TCP :30004 ESTAB(控制通道不通)"; return 1; }
+    if edge_erroring; then
+        log "  判据②失败:edge 正在持续报错(查 docker exec $EDGE tail /var/log/edge.log)"
+        return 1
+    fi
+    return 0
 }
 
 restart_edge() {
@@ -65,6 +105,19 @@ do_reboot() {
     log "⚠ 注意:tmux 会话与 RestartPolicy=no 的容器会丢失"
     logger -t remote-access-watchdog "自动重启:Beyond 隧道断连超过 $(((L4_ROUNDS-1)*5)) 分钟"
     sync; sleep 2
+
+    # 重启保证:优雅重启可能被卡住的单元拖住(NFS、容器、未响应的 umount)。
+    # 用一个【脱离本 cgroup】的瞬态定时器兜底 —— 本服务是 oneshot,直接后台
+    # 子进程会随服务退出被 systemd 杀掉,必须用 systemd-run 才能活到那时。
+    # 若优雅重启成功,机器早已下电,这个定时器永不触发。
+    if [ -w /proc/sysrq-trigger ] && command -v systemd-run >/dev/null 2>&1; then
+        systemd-run --collect --on-active=180s \
+            --unit=remote-access-force-reboot \
+            /bin/sh -c 'logger -t remote-access-watchdog "优雅重启 180s 未完成 → sysrq 强制重启"; sync; echo b > /proc/sysrq-trigger' \
+            >/dev/null 2>&1 && log "已布置 180s 强制重启兜底(sysrq)"
+    else
+        log "⚠ 无法布置强制兜底(sysrq 不可写或缺 systemd-run),仅依赖优雅重启"
+    fi
     systemctl reboot
 }
 
@@ -89,7 +142,7 @@ else
             if   [ "$cnt" -ge "$L4_ROUNDS" ]; then
                 do_reboot
             elif [ $((cnt % L3_ROUNDS)) -eq 0 ]; then
-                restart_edge "无底层会话已连续 ${cnt} 轮(约 $(((cnt-1)*5)) 分钟)"
+                restart_edge "隧道判据失败已连续 ${cnt} 轮(约 $(((cnt-1)*5)) 分钟)"
             fi
         fi
     fi
