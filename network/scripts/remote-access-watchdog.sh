@@ -13,7 +13,7 @@
 #   L4  【任何形式的未确认健康】连续 5 轮(约 20 分钟自愈无效) → reboot
 #       用独立计数器 ANYFAIL,只在隧道确认健康时清零 —— 这样反复抖动
 #       (每轮走不同分支)也能升级,不会被各分支的清零互相抵消
-#       (带 sysrq 强制兜底,防优雅重启被卡住的单元拖住)
+#       优雅重启若卡住,下一轮自动升级:reboot --force → sysrq-b
 #   RDP 独立检查:GRD 不活 / 3390 不监听 → 重启 gnome-remote-desktop
 set -uo pipefail
 
@@ -59,6 +59,9 @@ ERRCNT=/run/remote-access-watchdog.errcount   # 上次看到的 edge [E] 行数
 #              它驱动 L4。没有它的话:edge 若反复崩到 utun0 消失,每轮都走 L2、
 #              每轮清零 STATE,L4 永远不会触发 —— 与"无法恢复时必须重启"冲突。
 ANYFAIL=/run/remote-access-watchdog.anyfail
+# "已请求过优雅重启"标记。放在 /run(tmpfs)是刻意的:重启成功后它自动消失,
+# 不需要任何清理逻辑。若下一轮 timer 跑起来发现它还在,就说明优雅重启没成功。
+REBOOTREQ=/run/remote-access-watchdog.reboot-requested
 
 # ① 控制通道
 control_plane_up() {
@@ -106,27 +109,46 @@ do_reboot() {
         log "已达重启阈值,但开机仅 ${up}s(<${MIN_UPTIME}s)→ 跳过,防引导循环"; return
     fi
     now="$(date +%s)"; last="$(cat "$COOLDOWN" 2>/dev/null || echo 0)"
-    if [ $((now - last)) -lt "$COOLDOWN_SEC" ]; then
+    # 冷却只拦"新的一次重启";若本轮启动前已请求过优雅重启而机器仍在,
+    # 那是同一次重启的延续,必须放行去升级强度,否则会卡在冷却里永远起不来。
+    if [ ! -f "$REBOOTREQ" ] && [ $((now - last)) -lt "$COOLDOWN_SEC" ]; then
         log "已达重启阈值,但距上次自动重启仅 $(((now-last)/60)) 分钟(<$((COOLDOWN_SEC/60)))→ 跳过"; return
     fi
+    # ── 上一轮已经请求过优雅重启、而机器还在这里 → 说明它卡住了,升级强度 ──
+    # 判据可靠的原因:能执行到这里,说明 timer 仍在被调度;而 REBOOTREQ 在
+    # /run(tmpfs)里,重启成功就自然消失。所以"标记还在"= 上次没重启成功。
+    # 不用 systemd-run 布置瞬态定时器:那依赖 systemd 本身还能响应,而优雅重启
+    # 卡死最坏的情形正是 PID 1 自己卡住 —— 那时瞬态定时器同样不会触发。
+    if [ -f "$REBOOTREQ" ]; then
+        local reqage
+        reqage=$(( now - $(cat "$REBOOTREQ" 2>/dev/null || echo "$now") ))
+        log "⚠ 上次已请求优雅重启($((reqage/60)) 分钟前)但机器仍在运行 → 升级为强制重启"
+        logger -t remote-access-watchdog "优雅重启未生效($((reqage))s),升级强制重启"
+        sync
+        # ① reboot -f:直接调 reboot(2),不终止进程、不 umount,绕过 PID 1
+        log "  ① reboot --force"
+        systemctl reboot --force 2>/dev/null || reboot -f 2>/dev/null || true
+        sleep 10
+        # ② 还活着 → sysrq,完全绕开用户空间(需 kernel.sysrq 含 bit 128)
+        if [ -w /proc/sysrq-trigger ]; then
+            log "  ② sysrq-b(绕开用户空间)"
+            logger -t remote-access-watchdog "reboot --force 无效,sysrq-b"
+            echo b > /proc/sysrq-trigger
+        else
+            log "  ⚠ /proc/sysrq-trigger 不可写,已无更强手段(考虑启用硬件看门狗)"
+        fi
+        return
+    fi
+
     mkdir -p "$(dirname "$COOLDOWN")"; echo "$now" > "$COOLDOWN"
+    echo "$now" > "$REBOOTREQ"
     log "⚠ 隧道已断 $(((L4_ROUNDS-1)*5)) 分钟且容器重启无效 → 自动重启主机"
     log "⚠ 注意:tmux 会话与 RestartPolicy=no 的容器会丢失"
+    log "  若本次优雅重启卡住,下一轮(5 分钟后)会自动升级为强制重启"
     logger -t remote-access-watchdog "自动重启:Beyond 隧道断连超过 $(((L4_ROUNDS-1)*5)) 分钟"
     sync; sleep 2
-
-    # 重启保证:优雅重启可能被卡住的单元拖住(NFS、容器、未响应的 umount)。
-    # 用一个【脱离本 cgroup】的瞬态定时器兜底 —— 本服务是 oneshot,直接后台
-    # 子进程会随服务退出被 systemd 杀掉,必须用 systemd-run 才能活到那时。
-    # 若优雅重启成功,机器早已下电,这个定时器永不触发。
-    if [ -w /proc/sysrq-trigger ] && command -v systemd-run >/dev/null 2>&1; then
-        systemd-run --collect --on-active=180s \
-            --unit=remote-access-force-reboot \
-            /bin/sh -c 'logger -t remote-access-watchdog "优雅重启 180s 未完成 → sysrq 强制重启"; sync; echo b > /proc/sysrq-trigger' \
-            >/dev/null 2>&1 && log "已布置 180s 强制重启兜底(sysrq)"
-    else
-        log "⚠ 无法布置强制兜底(sysrq 不可写或缺 systemd-run),仅依赖优雅重启"
-    fi
+    # 注:/sbin/reboot 就是 systemctl 的软链,两者等价;本服务以 root 运行,
+    # 不需要 sudo(加 sudo 只会多一层 sudoers 依赖,却不增加任何能力)。
     systemctl reboot
 }
 
