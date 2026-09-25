@@ -26,7 +26,18 @@ COMPAT_MARK=/run/beyond-eno2.routes      # 旧版 watchdog 仍读这个路径
 
 log() { printf '[ensure-beyond-underlay] %s\n' "$*"; }
 
-ip link show "$IFACE" >/dev/null 2>&1 || { log "网卡 $IFACE 不存在,跳过"; exit 0; }
+# 网卡可用性:不能只查"存在"。拔掉网线后 link 仍然存在(只是 operstate=down),
+# 旧版只查 `ip link show` 会继续执行,把路由装到一条死链路上 —— 而且是在删掉
+# 上一批能用的路由之后,结果主表一条 /32 都没有,Beyond 流量落进 TUN。
+if ! ip link show "$IFACE" >/dev/null 2>&1; then
+    log "网卡 $IFACE 不存在,保留现有路由不动"; exit 0
+fi
+state=$(cat "/sys/class/net/$IFACE/operstate" 2>/dev/null || echo unknown)
+carrier=$(cat "/sys/class/net/$IFACE/carrier" 2>/dev/null || echo 0)
+if [ "$state" != up ] || [ "$carrier" != 1 ]; then
+    log "✗ 网卡 $IFACE 不可用(operstate=$state carrier=$carrier)→ 保留现有路由不动"
+    exit 0
+fi
 
 # ── 自动推导源地址 ──
 SRCIP=${BEYOND_SRCIP:-}
@@ -68,24 +79,39 @@ ips=$(printf '%s\n' $ips | grep -E '^[0-9.]+$' | grep -vE '^28\.' | sort -u)
 [ -n "$ips" ] || { log "✗ 没有可用目标 IP,保留现有路由不动"; exit 0; }
 log "目标节点: $(echo $ips | tr '\n' ' ')"
 
-# ── 2. 清掉上次装的(节点会变) ──
-for m in "$MARK" "$COMPAT_MARK"; do
-    [ -r "$m" ] || continue
-    while read -r old; do [ -n "$old" ] && ip route del "$old" 2>/dev/null; done < "$m"
-done
-: > "$MARK"
-
-# ── 3. 装 /32 明细路由 ──
-n=0
+# ── 2. 先装新路由(ip route replace 幂等,已存在则覆盖) ──
+# 顺序很重要:必须【先装后剪】。旧版是先删再装,一旦装不上(网卡 down、网关
+# 不可达等),主表就一条 /32 都没有 —— Beyond 流量落到 dev Mihomo,或落到
+# guard 的兜底 0.0.0.0/1 → tun0(openvpn3),两者都会让 NAT 打洞失败、隧道断。
+NEW=$(mktemp) || { log "✗ 无法创建临时文件"; exit 0; }
+trap 'rm -f "$NEW"' EXIT
+n=0; fail=0
 for ip in $ips; do
     if ip route replace "$ip/32" via "$GW" dev "$IFACE" $ONLINK 2>/dev/null; then
-        echo "$ip/32" >> "$MARK"; n=$((n+1))
+        echo "$ip/32" >> "$NEW"; n=$((n+1))
     else
-        log "警告: 无法为 $ip 装路由"
+        log "警告: 无法为 $ip 装路由"; fail=$((fail+1))
     fi
 done
+if [ "$n" -eq 0 ]; then
+    log "✗ 一条路由都没装上($fail 次失败)→ 保留现有路由不动,不做任何删除"
+    exit 0
+fi
+log "已装 $n 条 /32 路由 → $IFACE$([ "$fail" -gt 0 ] && echo "($fail 条失败)")"
+
+# ── 3. 剪掉不再需要的旧路由(只删【不在新集合里】的) ──
+pruned=0
+for m in "$MARK" "$COMPAT_MARK"; do
+    [ -r "$m" ] || continue
+    while read -r old; do
+        [ -n "$old" ] || continue
+        grep -qxF "$old" "$NEW" && continue          # 仍在用,别删
+        ip route del "$old" 2>/dev/null && { log "  剪除旧路由 $old"; pruned=$((pruned+1)); }
+    done < "$m"
+done
+[ "$pruned" -gt 0 ] && log "剪除 $pruned 条不再需要的旧路由"
+install -m 0644 "$NEW" "$MARK" 2>/dev/null || cp -f "$NEW" "$MARK"
 cp -f "$MARK" "$COMPAT_MARK" 2>/dev/null || true
-log "已装 $n 条 /32 路由 → $IFACE"
 
 # ── 4. 验证:必须走本网卡,而不是 dev Mihomo ──
 bad=0
