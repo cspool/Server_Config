@@ -10,7 +10,9 @@
 #   L1  容器不在 running                → docker start
 #   L2  utun0 缺失 / 无 overlay 路由     → docker restart edge
 #   L3  隧道判据失败,连续 1 轮(5 分钟) → 重启 edge 容器
-#   L4  隧道判据失败,连续 5 轮(首次发现后持续 20 分钟自愈无效) → reboot
+#   L4  【任何形式的未确认健康】连续 5 轮(约 20 分钟自愈无效) → reboot
+#       用独立计数器 ANYFAIL,只在隧道确认健康时清零 —— 这样反复抖动
+#       (每轮走不同分支)也能升级,不会被各分支的清零互相抵消
 #       (带 sysrq 强制兜底,防优雅重启被卡住的单元拖住)
 #   RDP 独立检查:GRD 不活 / 3390 不监听 → 重启 gnome-remote-desktop
 set -uo pipefail
@@ -50,6 +52,13 @@ log() { printf '[remote-access-watchdog] %s\n' "$*"; }
 # 判定:① 与 ② 都通过才算隧道健康。任一失败即计数。
 
 ERRCNT=/run/remote-access-watchdog.errcount   # 上次看到的 edge [E] 行数
+# 两个计数器,职责不同:
+#   STATE   —— 连续"判据失败"轮数,驱动 L3 的容器重启。L1/L2 分支会清零它,
+#              因为那两级已经做了动作,应当给它重新观察的机会。
+#   ANYFAIL —— 连续"未确认健康"轮数,**只在 tunnel_up 成功时清零**。
+#              它驱动 L4。没有它的话:edge 若反复崩到 utun0 消失,每轮都走 L2、
+#              每轮清零 STATE,L4 永远不会触发 —— 与"无法恢复时必须重启"冲突。
+ANYFAIL=/run/remote-access-watchdog.anyfail
 
 # ① 控制通道
 control_plane_up() {
@@ -122,28 +131,41 @@ do_reboot() {
 }
 
 # ───── 隧道 ─────
+# 累加"未确认健康"计数并在达到 L4 时重启。任何失败分支都要调它 ——
+# 这样反复抖动(每轮走不同分支)也能升级,而不是被各自的清零互相抵消。
+bump_anyfail() {
+    local a
+    a="$(cat "$ANYFAIL" 2>/dev/null || echo 0)"; case "$a" in ''|*[!0-9]*) a=0 ;; esac
+    a=$((a + 1)); echo "$a" > "$ANYFAIL"
+    log "  未确认健康累计 ${a}/${L4_ROUNDS} 轮(约 $(((a-1)*5)) 分钟)"
+    [ "$a" -ge "$L4_ROUNDS" ] && do_reboot
+}
+
 st="$(docker inspect -f '{{.State.Status}}' "$EDGE" 2>/dev/null || echo missing)"
 if [ "$st" = missing ]; then
     log "✗ 容器 $EDGE 不存在,需人工重装(quick-install)"
+    # 容器都没了,重启主机也变不出来 —— 不累加,避免无意义的反复重启
 elif [ "$st" != running ]; then
     log "容器状态 $st → 启动"; docker start "$EDGE" >/dev/null 2>&1; : > "$STATE"
+    bump_anyfail
 else
     if ! ip link show utun0 >/dev/null 2>&1; then
-        restart_edge "utun0 接口缺失"; : > "$STATE"
+        restart_edge "utun0 接口缺失"; : > "$STATE"; bump_anyfail
     elif [ -z "$(ip route show dev utun0 2>/dev/null)" ]; then
-        restart_edge "utun0 无 overlay 路由"; : > "$STATE"
+        restart_edge "utun0 无 overlay 路由"; : > "$STATE"; bump_anyfail
     else
         cnt="$(cat "$STATE" 2>/dev/null || echo 0)"; [ -z "$cnt" ] && cnt=0
         if tunnel_up; then
-            [ "$cnt" -gt 0 ] && log "✓ 隧道已恢复(此前连续失败 ${cnt} 轮)"
-            echo 0 > "$STATE"
+            [ "$cnt" -gt 0 ] && log "✓ 隧道已恢复(此前连续判据失败 ${cnt} 轮)"
+            a="$(cat "$ANYFAIL" 2>/dev/null || echo 0)"
+            [ "${a:-0}" != 0 ] && log "✓ 未确认健康计数归零(此前 ${a} 轮)"
+            echo 0 > "$STATE"; echo 0 > "$ANYFAIL"
         else
             cnt=$((cnt + 1)); echo "$cnt" > "$STATE"
-            if   [ "$cnt" -ge "$L4_ROUNDS" ]; then
-                do_reboot
-            elif [ $((cnt % L3_ROUNDS)) -eq 0 ]; then
+            if [ $((cnt % L3_ROUNDS)) -eq 0 ]; then
                 restart_edge "隧道判据失败已连续 ${cnt} 轮(约 $(((cnt-1)*5)) 分钟)"
             fi
+            bump_anyfail       # L4 的判定统一交给它
         fi
     fi
 fi

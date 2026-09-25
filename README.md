@@ -199,7 +199,7 @@ sudo visudo -c -f /etc/sudoers.d/gui-cli-switch
 - 远程桌面使用 GNOME Remote Desktop 的桌面共享模式;系统级远程登录需要 TPM,本机(Supermicro X12DAi-N6)无 TPM,故未启用。
 - **eno2 已禁用**(2026-09-25),全机只依赖 `eno1`。eno2 接的是校园网,认证过期后上游用自签
   证书**透明劫持 HTTPS** —— 曾导致 Beyond edge 拿到认证跳转 HTML 而非 JSON、隧道整体不可用,
-  而所有网络层检查都显示"正常",极难定位。该账号处于「免费区域」无外网额度,重新认证也无济于事。
+  而所有网络层检查都显示"正常",极难定位。该账号只允许一个设备在线,而设备位被上游小米路由器的 WAN 占着 —— eno2 认证成功只会把路由器顶下线。
   禁用方式(`network/scripts/disable-eno2.sh`)保留了连接配置,一条命令可回切;
   需要校园网时的认证方法见指南「为什么禁用 eno2」一节。
 - `network/config/beyond.conf` 的 `BEYOND_IFACE` 决定 Beyond 底层出口网卡(当前 `eno1`),
