@@ -1,0 +1,121 @@
+#!/bin/sh
+# Restart obsidian.service only when its Local REST API is down AND the process is
+# making no progress.
+#
+# Why progress and not a timeout: a cold start on this vault rebuilds the Omnisearch
+# BM25 index, which can keep port 27123 closed for a long time and grows with the
+# corpus. Any fixed grace period is a guess that breaks twice -- too short and the
+# watchdog kills a healthy startup in a loop (observed: GRACE=180 with a 62k-file
+# vault restarted it every ~190s forever, so it never finished loading); too long and
+# a genuine renderer crash goes unnoticed for that whole window. Indexing burns CPU
+# continuously, a hung renderer does not, so CPU accumulation separates the two
+# without needing to know how long a load should take.
+#
+# Restart happens only after several consecutive rounds of "port down AND no CPU
+# progress", and is capped per hour so no configuration can produce a restart loop.
+
+GRACE=180                 # never touch the service this soon after it started
+STRIKES_NEEDED=3          # consecutive no-progress rounds before restarting
+CPU_TICKS_MIN=50          # >=0.5s of CPU across the 10s probe gap counts as progress
+MAX_RESTARTS_PER_HOUR=3
+STATE="${XDG_RUNTIME_DIR:-/tmp}/obsidian-rest-watchdog.state"
+
+log() { echo "$*"; }
+
+probe_rest() { curl -s -m 8 -o /dev/null -w '%{http_code}' http://127.0.0.1:27123/ 2>/dev/null; }
+probe_omni() { curl -s -m 8 -o /dev/null -w '%{http_code}' "http://127.0.0.1:51361/search?q=healthcheck" 2>/dev/null; }
+
+# Total CPU ticks consumed by every obsidian process (utime+stime from /proc).
+cpu_ticks() {
+    total=0
+    for pid in $(pgrep -f '[o]bsidian' 2>/dev/null); do
+        [ -r "/proc/$pid/stat" ] || continue
+        # fields 14,15 = utime,stime; comm may contain spaces so cut after ')'
+        t=$(sed 's/.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $12 + $13}')
+        [ -n "$t" ] && total=$((total + t))
+    done
+    echo "$total"
+}
+
+read_state() {  # strikes restarts_csv
+    if [ -r "$STATE" ]; then
+        strikes=$(sed -n 1p "$STATE" 2>/dev/null)
+        restarts=$(sed -n 2p "$STATE" 2>/dev/null)
+    fi
+    case "$strikes" in ''|*[!0-9]*) strikes=0 ;; esac
+    [ -n "$restarts" ] || restarts=""
+}
+
+write_state() { printf '%s\n%s\n' "$1" "$2" > "$STATE"; }
+
+# Drop restart timestamps older than an hour, then count what is left.
+recent_restarts() {
+    now=$1; kept=""; n=0
+    OLDIFS=$IFS; IFS=','
+    for t in $restarts; do
+        case "$t" in ''|*[!0-9]*) continue ;; esac
+        if [ $((now - t)) -lt 3600 ]; then
+            kept="${kept:+$kept,}$t"; n=$((n + 1))
+        fi
+    done
+    IFS=$OLDIFS
+    restarts_kept=$kept
+    echo "$n"
+}
+
+strikes=0; restarts=""
+read_state
+now_epoch=$(date +%s)
+
+# --- startup grace ---------------------------------------------------------
+ts=$(systemctl --user show obsidian.service -p ActiveEnterTimestampMonotonic --value 2>/dev/null)
+now_mono=$(awk '{printf "%d", $1*1000000}' /proc/uptime)
+if [ -n "$ts" ] && [ "$ts" -gt 0 ] && [ $(((now_mono - ts) / 1000000)) -lt "$GRACE" ]; then
+    log "obsidian 启动不足 ${GRACE}s，跳过探测"
+    exit 0
+fi
+
+# --- probe 1 ---------------------------------------------------------------
+a=$(probe_rest)
+if [ "$a" = "200" ]; then
+    o=$(probe_omni)
+    [ "$o" = "200" ] || log "注意：27123 正常但 Omnisearch 51361 返回 $o（索引可能仍在重建，不触发重启）"
+    write_state 0 "$restarts"
+    exit 0
+fi
+
+c0=$(cpu_ticks)
+sleep 10
+b=$(probe_rest)
+if [ "$b" = "200" ]; then
+    write_state 0 "$restarts"
+    exit 0
+fi
+c1=$(cpu_ticks)
+delta=$((c1 - c0))
+
+# --- progress check: indexing is normal, do not restart --------------------
+if [ "$delta" -ge "$CPU_TICKS_MIN" ]; then
+    log "27123 未就绪，但 obsidian 在消耗 CPU（10s 内 ${delta} ticks）——判定为正在加载/建索引，不重启"
+    write_state 0 "$restarts"
+    exit 0
+fi
+
+strikes=$((strikes + 1))
+if [ "$strikes" -lt "$STRIKES_NEEDED" ]; then
+    log "27123 down 且无 CPU 进展（${delta} ticks），strike ${strikes}/${STRIKES_NEEDED}，暂不重启"
+    write_state "$strikes" "$restarts"
+    exit 0
+fi
+
+# --- restart budget --------------------------------------------------------
+n=$(recent_restarts "$now_epoch")
+if [ "$n" -ge "$MAX_RESTARTS_PER_HOUR" ]; then
+    log "27123 down 且无进展，但最近一小时已重启 ${n} 次（上限 ${MAX_RESTARTS_PER_HOUR}）——放弃自动重启，请人工检查 obsidian.service"
+    write_state "$strikes" "$restarts_kept"
+    exit 0
+fi
+
+log "obsidian REST down (probes: $a/$b, CPU 10s 内仅 ${delta} ticks, 连续 ${strikes} 轮无进展) - restarting obsidian.service"
+systemctl --user restart obsidian.service
+write_state 0 "${restarts_kept:+$restarts_kept,}$now_epoch"

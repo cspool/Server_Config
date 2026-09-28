@@ -1,11 +1,13 @@
 [Unit]
-Description=Obsidian (Local REST API for the obsidian MCP) - always on, window when a GUI session exists, headless otherwise
+Description=Obsidian (Local REST API for the obsidian MCP) - always on, headless by default
 # Never give up restarting.
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-# Picks window vs headless mode; see the script for details.
+# 默认 headless (CLI)；要窗口就设 Environment=OBSIDIAN_FORCE_GUI=1。详见脚本注释。
+# 2026-09-28：headless 路径必须 scrub 桌面会话变量（SESSION_MANAGER 等），
+#   否则在活着的 GNOME 会话下由 systemd 启动会卡死——脚本里已处理。
 ExecStart=%h/.local/bin/obsidian-managed
 # Restart on clean quit, crash, kill, or display loss.
 Restart=always
