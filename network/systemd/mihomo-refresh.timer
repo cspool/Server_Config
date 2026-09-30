@@ -3,6 +3,9 @@ Description=Daily mihomo subscription refresh
 
 [Timer]
 OnCalendar=*-*-* 04:30:00
+# 2026-09-29 新增:上游抖动导致 04:30 那次失败时,中午再试一次。
+# 脚本内已有 4 次重试;这一条是"整天都没刷成"的兜底。
+OnCalendar=*-*-* 12:30:00
 Persistent=true
 
 [Install]

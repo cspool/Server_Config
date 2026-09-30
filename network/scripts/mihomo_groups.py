@@ -16,21 +16,43 @@ refresh.py(每日刷新)与 prune-dangling-proxies.py(启动自愈)共用本模�
 """
 import re
 
+# 所有【英文缩写】都必须带词边界 \b。2026-09-29 的教训:
+#   re.search("US", "DisneyPlus", re.I) 会命中 "Plus" 里的 "us"
+#   → DisneyPlus 被误判成美国地区组、被塞进 Proxy 成员
+#   → DisneyPlus 又引用 Proxy → mihomo 报
+#     "loop is detected in ProxyGroup: [Proxy DisneyPlus]",整份配置校验失败。
+# 中文词与 emoji 不需要边界(它们不会嵌在英文单词里)。
 REGION_PAT = {
-    "香港":   r"香港|HK|Hong\s*Kong|🇭🇰",
-    "日本":   r"日本|JP|Japan|Tokyo|Osaka|🇯🇵",
-    "美国":   r"美国|US|USA|United\s*States|America|🇺🇸",
-    "新加坡": r"新加坡|SG|Singapore|狮城|🇸🇬",
-    "台湾":   r"台湾|台灣|TW|Taiwan|🇹🇼",
-    "英国":   r"英国|UK|GB|United\s*Kingdom|Britain|🇬🇧",
-    "韩国":   r"韩国|韓國|KR|Korea|Seoul|🇰🇷",
-    "德国":   r"德国|DE|German|Frankfurt|🇩🇪",
-    "法国":   r"法国|FR|France|Paris|🇫🇷",
-    "荷兰":   r"荷兰|NL|Netherlands|Amsterdam|🇳🇱",
+    "香港":   r"香港|\bHK\b|Hong\s*Kong|🇭🇰",
+    "日本":   r"日本|\bJP\b|Japan|Tokyo|Osaka|🇯🇵",
+    "美国":   r"美国|\bUSA?\b|United\s*States|America|🇺🇸",
+    "新加坡": r"新加坡|\bSG\b|Singapore|狮城|🇸🇬",
+    "台湾":   r"台湾|台灣|\bTW\b|Taiwan|🇹🇼",
+    "英国":   r"英国|\bUK\b|\bGB\b|United\s*Kingdom|Britain|🇬🇧",
+    "韩国":   r"韩国|韓國|\bKR\b|Korea|Seoul|🇰🇷",
+    "德国":   r"德国|\bDE\b|German|Frankfurt|🇩🇪",
+    "法国":   r"法国|\bFR\b|France|Paris|🇫🇷",
+    "荷兰":   r"荷兰|\bNL\b|Netherlands|Amsterdam|🇳🇱",
 }
 
 # 这些组即使成员里没有别的组名,也不该被塞进节点。
 SKIP_GROUPS = {"AdBlock"}
+
+# 自动选优组的名字与参数。2026-09-29 新增,解决一个结构缺陷:
+# 地区组本来就是 fallback(会自动切换),但 Proxy 是 Selector 且成员直接是
+# 【具体节点】—— 用户选中的节点一挂,所有走 Proxy 的流量全卡,fallback 的
+# 自动能力完全没被用上。实测那天 44 个节点只剩 7 个 alive、选中的节点 8/8 超时。
+AUTO_GROUP = "Auto"
+AUTO_DEF = {
+    "name": AUTO_GROUP,
+    "type": "url-test",
+    "url": "http://www.gstatic.com/generate_204",
+    "interval": 300,          # 每 5 分钟复测
+    "tolerance": 50,          # 差值小于 50ms 不切,避免反复抖动
+}
+# Proxy 是"总出口"组,必须始终重建(即使它引用了别的组)。
+# 其余引用了组名的选择型组一律不动 —— 它们靠被引用的组自动获得节点。
+ALWAYS_REBUILD = {"Proxy"}
 
 
 def rebuild(cfg, log=print):
@@ -54,13 +76,36 @@ def rebuild(cfg, log=print):
 
     changed = 0
     matched = set()
+
+    # ── Auto 组:url-test,自动选最快的可用节点 ──
+    # 它是自动故障转移的载体:节点挂了 mihomo 自己换,不需要人工干预。
+    auto = next((g for g in groups if g.get("name") == AUTO_GROUP), None)
+    if auto is None:
+        auto = dict(AUTO_DEF)
+        auto["proxies"] = list(sub)
+        # 插在 Proxy 之前,便于阅读;顺序对 mihomo 无影响
+        idx = next((i for i, g in enumerate(groups) if g.get("name") == "Proxy"), 0)
+        groups.insert(idx, auto)
+        gnames.add(AUTO_GROUP)
+        changed += 1
+        log(f"  新建 [{AUTO_GROUP}] (url-test): {len(sub)} 个节点,自动选最快")
+    else:
+        for k, v in AUTO_DEF.items():
+            auto.setdefault(k, v)
+        auto["type"] = AUTO_DEF["type"]          # 纠正被改成 select 的情况
+        if list(auto.get("proxies") or []) != list(sub):
+            n_old = len(auto.get("proxies") or [])
+            auto["proxies"] = list(sub)
+            changed += 1
+            log(f"  重建 [{AUTO_GROUP}]: {n_old} → {len(sub)} 个节点")
+
     for g in groups:
         name = g.get("name", "")
-        if name in SKIP_GROUPS:
+        if name in SKIP_GROUPS or name == AUTO_GROUP:
             continue
         cur = list(g.get("proxies") or [])
-        # 引用了其它组 → 选择型组,不动
-        if any(x in gnames for x in cur):
+        # 引用了其它组 → 选择型组,不动。Proxy 例外:它是总出口,必须始终重建。
+        if name not in ALWAYS_REBUILD and any(x in gnames for x in cur):
             continue
 
         want = None
@@ -73,7 +118,25 @@ def rebuild(cfg, log=print):
                     log(f"  组 [{name}] 无匹配节点,保留 DIRECT 占位")
                 break
         if want is None and name == "Proxy":
-            want = sub + ["DIRECT"] + local
+            # 顺序即优先级(给人看的列表顺序):
+            #   Auto(自动选优)→ 地区组(各自 fallback)→ 具体节点 → DIRECT → 本地伪出口
+            # 默认选 Auto,所以节点挂了会自动切;需要固定某节点时仍可手动选。
+            # 双重判据,缺一不可:
+            #   ① 名字匹配地区正则
+            #   ② 且它【直接指向节点】(成员里没有任何组名)
+            # ② 是防循环的结构性保险:像 DisneyPlus 这种成员为
+            # [Proxy, 香港, 日本...] 的选择型组,即使正则误判也进不来。
+            regions = []
+            for g2 in groups:
+                n2 = g2.get("name", "")
+                if n2 in SKIP_GROUPS or n2 in ALWAYS_REBUILD or n2 == AUTO_GROUP:
+                    continue
+                if not any(re.search(pt, n2, re.I) for pt in REGION_PAT.values()):
+                    continue
+                if any(x in gnames for x in (g2.get("proxies") or [])):
+                    continue          # 引用了别的组 → 不是地区组
+                regions.append(n2)
+            want = [AUTO_GROUP] + regions + sub + ["DIRECT"] + local
 
         if want is None or cur == want:
             continue
@@ -107,11 +170,20 @@ def group_health(cfg):
         if name in SKIP_GROUPS:
             continue
         ps = list(g.get("proxies") or [])
-        if any(x in gnames for x in ps):
-            continue
         is_region = any(re.search(p, name, re.I) for p in REGION_PAT.values())
-        if not (is_region or name == "Proxy"):
+        if not (is_region or name in ("Proxy", AUTO_GROUP)):
             continue
-        if not any(x in sub for x in ps):
+        # Proxy 引用 Auto / 地区组是正常且期望的结构:只要它能【经由某个引用】
+        # 到达真实节点就算健康,不必自己直接列节点。
+        if any(x in sub for x in ps):
+            continue
+        reachable = False
+        for x in ps:
+            if x in gnames:
+                sub_g = next((g2 for g2 in groups if g2.get("name") == x), None)
+                if sub_g and any(y in sub for y in (sub_g.get("proxies") or [])):
+                    reachable = True
+                    break
+        if not reachable:
             bad.append(name)
     return bad

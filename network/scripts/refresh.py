@@ -14,7 +14,7 @@ crash loop(实际发生过 212 次重启)。现在加了剔除 + 校验 + 回滚
 而 api.github.com 走 OpenAI 组反而正常)。现在增加 rebuild:每次刷新都按
 **地区正则**重建组成员,不依赖任何固定节点名,机场随意改名也能跟上。
 """
-import os, subprocess, sys, urllib.request, shutil, datetime, tempfile
+import os, subprocess, sys, time, urllib.request, shutil, datetime, tempfile
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -76,13 +76,39 @@ def main():
     if not url:
         log("订阅 URL 为空,放弃"); return 1
 
-    # 1. 下载订阅
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "clash-verge/mihomo"})
-        sub = yaml.safe_load(urllib.request.urlopen(req, timeout=30)
-                             .read().decode("utf-8", "replace"))
-    except Exception as e:
-        log(f"下载失败: {e};保留现有配置"); return 1
+    # 1. 下载订阅 —— 带重试
+    # 2026-09-29:单次失败即放弃,要等 24 小时后才再试。那天就因为一次
+    #   SSL: UNEXPECTED_EOF_WHILE_READING 整天没刷新(前一天是成功的)。
+    #   上游链路抖动是常态,重试 + 退避 + 代理回退三招应对。
+    sub = None
+    attempts = [
+        ("直连", None, 0),
+        ("直连(退避 5s)", None, 5),
+        ("直连(退避 20s)", None, 20),
+        ("经 mihomo 代理", "http://127.0.0.1:7897", 5),
+    ]
+    for label, proxy, wait in attempts:
+        if wait:
+            time.sleep(wait)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "clash-verge/mihomo"})
+            if proxy:
+                # 订阅域名多在境外,链路不稳时经本机代理反而更稳;
+                # 放在最后是因为它要求 mihomo 已在运行。
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+                raw = opener.open(req, timeout=30).read()
+            else:
+                raw = urllib.request.urlopen(req, timeout=30).read()
+            sub = yaml.safe_load(raw.decode("utf-8", "replace"))
+            if label != "直连":
+                log(f"下载成功({label})")
+            break
+        except Exception as e:
+            log(f"下载失败({label}): {str(e)[:110]}")
+    if sub is None:
+        log("✗ 所有下载方式均失败,保留现有配置")
+        return 1
     new_nodes = (sub or {}).get("proxies") or []
     if not new_nodes:
         log("订阅无 proxies,保留现有配置"); return 1
