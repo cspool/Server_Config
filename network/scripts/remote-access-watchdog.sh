@@ -14,6 +14,7 @@
 #       用独立计数器 ANYFAIL,只在隧道确认健康时清零 —— 这样反复抖动
 #       (每轮走不同分支)也能升级,不会被各分支的清零互相抵消
 #       优雅重启若卡住,下一轮自动升级:reboot --force → sysrq-b
+#       连续重启上限 MAX_REBOOTS=3:达到后停手并记日志(物理链路不通时重启无用)
 #   RDP 独立检查:GRD 不活 / 3390 不监听 → 重启 gnome-remote-desktop
 set -uo pipefail
 
@@ -31,6 +32,11 @@ L3_ROUNDS=1          # 1 轮 × 5 分钟 = 5 分钟:重启容器
 L4_ROUNDS=5          # 第5轮触发:首次发现后已连续尝试 4×5=20 分钟
 MIN_UPTIME=900       # 开机不足 15 分钟不重启,防引导循环
 COOLDOWN_SEC=7200    # 两次自动重启至少间隔 2 小时
+MAX_REBOOTS=3        # 连续自动重启上限。达到后只记日志不再重启 ——
+                     # 物理链路不通(网线、上游设备、校园网认证失效)时重启
+                     # 毫无作用,无限重启只会让机器永远起不来、还掩盖真因。
+                     # 隧道一旦恢复健康即清零(见 tunnel_up 成功分支)。
+REBOOTCNT=/var/lib/remote-access-watchdog.rebootcount   # 跨重启的连续重启计数
 
 log() { printf '[remote-access-watchdog] %s\n' "$*"; }
 
@@ -140,7 +146,49 @@ do_reboot() {
         return
     fi
 
+    # ── 链路本身不通 → 重启毫无意义,直接停手 ──
+    # /run/campus-net-state 由 mihomo 的第一个 ExecStartPre(ensure-campus-net.sh)写入,
+    # 但那只是开机时的快照;这里现场再探一次,避免拿着过期结论做决定。
+    local netstate=""
+    if curl -s --noproxy '*' -m 6 -o /dev/null -w '%{http_code}' \
+         http://connectivitycheck.gstatic.com/generate_204 2>/dev/null | grep -q '^204$'; then
+        netstate=online
+    else
+        # 再探一个端点,单点失败不作数
+        if curl -s --noproxy '*' -m 6 -o /dev/null \
+             http://www.msftconnecttest.com/connecttest.txt 2>/dev/null; then
+            netstate=captive      # 能连上但不是干净的 204 → 多半是认证劫持
+        else
+            netstate=offline
+        fi
+    fi
+    if [ "$netstate" != online ]; then
+        log "⚠ 达到重启阈值,但链路状态为 ${netstate} → 不重启"
+        case "$netstate" in
+            captive) log "  链路需要认证(校园网)。重启不会自动认证,只会让机器再失联一次。" ;;
+            offline) log "  链路完全不通(网线/上游设备)。重启对物理问题无效。" ;;
+        esac
+        log "  认证或修好链路后:sudo systemctl restart mihomo"
+        logger -t remote-access-watchdog "达重启阈值但链路 ${netstate},跳过重启"
+        return
+    fi
+
+    # ── 连续自动重启上限 ──
+    # 放在冷却之后、真正动手之前。物理层断了的话重启永远没用,
+    # 这道闸把"无限重启"变成"重启 N 次后停手并留下日志等人工介入"。
+    rc="$(cat "$REBOOTCNT" 2>/dev/null)"; case "$rc" in ''|*[!0-9]*) rc=0 ;; esac
+    if [ "$rc" -ge "$MAX_REBOOTS" ]; then
+        log "⚠ 已连续自动重启 ${rc} 次仍未恢复(上限 ${MAX_REBOOTS})→ 停止重启"
+        log "  很可能是物理链路/上游问题(网线、路由器、校园网认证),重启无用。"
+        log "  排查:ip -brief link / curl -s -o /dev/null -w '%{http_code}' http://connectivitycheck.gstatic.com/generate_204"
+        log "  人工处理后清零:sudo rm -f $REBOOTCNT"
+        logger -t remote-access-watchdog "已达连续重启上限 ${MAX_REBOOTS},停止自动重启,需人工介入"
+        return
+    fi
+
     mkdir -p "$(dirname "$COOLDOWN")"; echo "$now" > "$COOLDOWN"
+    echo "$((rc + 1))" > "$REBOOTCNT"
+    log "  这是第 $((rc + 1))/${MAX_REBOOTS} 次连续自动重启"
     echo "$now" > "$REBOOTREQ"
     log "⚠ 隧道已断 $(((L4_ROUNDS-1)*5)) 分钟且容器重启无效 → 自动重启主机"
     log "⚠ 注意:tmux 会话与 RestartPolicy=no 的容器会丢失"
@@ -182,6 +230,14 @@ else
             a="$(cat "$ANYFAIL" 2>/dev/null || echo 0)"
             [ "${a:-0}" != 0 ] && log "✓ 未确认健康计数归零(此前 ${a} 轮)"
             echo 0 > "$STATE"; echo 0 > "$ANYFAIL"
+            # 隧道确认健康 → 之前的重启起了作用(或问题自愈),清零重启计数,
+            # 让下一次真故障仍有完整的 MAX_REBOOTS 次机会。
+            rc="$(cat "$REBOOTCNT" 2>/dev/null)"; case "$rc" in ''|*[!0-9]*) rc=0 ;; esac
+            if [ "$rc" != 0 ]; then
+                log "✓ 隧道健康,连续重启计数归零(此前 ${rc} 次)"
+                echo 0 > "$REBOOTCNT"
+            fi
+            rm -f "$REBOOTREQ"
         else
             cnt=$((cnt + 1)); echo "$cnt" > "$STATE"
             if [ $((cnt % L3_ROUNDS)) -eq 0 ]; then

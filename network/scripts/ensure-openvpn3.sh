@@ -16,6 +16,15 @@ log() { printf '[ensure-openvpn3] %s\n' "$*"; }
 ovpn() { runuser -u "$VPN_USER" -- openvpn3 "$@" 2>/dev/null; }
 tun_name() { ip -o -4 addr show 2>/dev/null | awk '$4 ~ /^198\.18\./ {print $2; exit}'; }
 
+# 0. 链路未联网 → 跳过。ensure-campus-net.sh 判定为 captive/offline 时会留这个标记。
+#    未认证时 VPN 服务器必然连不上,硬等 WAIT_SECS 只是把启动拖慢 45 秒,
+#    还会把 mihomo.service 的 TimeoutStartSec 吃掉一大半。
+if [ -f /run/campus-skip-openvpn3 ]; then
+    log "链路未联网(见 /run/campus-net-state)→ 跳过 VPN 连接尝试"
+    log "  认证完成后执行:sudo systemctl restart mihomo"
+    exit 0
+fi
+
 # 1. 已有有效隧道 → 直接放行
 t="$(tun_name)"
 if [ -n "$t" ]; then
