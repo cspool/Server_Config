@@ -6,6 +6,14 @@
 #   default dev Mihomo;9003 (lookup main suppress_prefixlength 0) 接着查【主表的
 #   明细路由】。所以在主表给 Beyond 节点装 /32,9003 命中它 → 流量根本不进 TUN。
 #
+# 2026-10-08 补充:上面"9002 跳过、9003 查主表"的机制有一个前提 —— 表 2022 里只有一条
+#   default。一旦 tun.route-exclude-address 非空(campus-portal-direct.py 加了 RFC1918 三段),
+#   mihomo 会把默认路由拆成 30 多段明细前缀(0.0.0.0/5、128.0.0.0/3 …),suppress_prefixlength 0
+#   压不住它们,节点流量在到达主表 /32 之前就被 9002 送进 TUN(实测 ip route get 返回
+#   dev Mihomo table 2022,edge 一半连接源是 28.0.0.1)。
+#   所以再加一道:priority 8999 的 "to <节点>/32 lookup main",排在 9002 之前,
+#   不依赖 mihomo 配置,节点 IP 变了随本脚本一起变。清理时 netstack/net-reset 会连 8999 一起删。
+#
 # 已证伪的两种做法(勿再尝试,见 deprecated/README.md):
 #   · mihomo 规则指向 type:direct + interface-name  → 仍先进 TUN,源变 28.0.0.1
 #   · 只用 tun.route-exclude-address                → 排除后走主表默认路由
@@ -25,6 +33,42 @@ MARK=${BEYOND_MARK:-/run/beyond-underlay.routes}
 COMPAT_MARK=/run/beyond-eno2.routes      # 旧版 watchdog 仍读这个路径
 
 log() { printf '[ensure-beyond-underlay] %s\n' "$*"; }
+
+# ── overlay 段必须绕开 mihomo TUN ────────────────────────────────────
+# 【位置关键】必须放在本脚本所有 exit 之前。2026-10-09 第一版把它追加在文件
+# 末尾,而第 148 行(以及网卡不可用、路由全失败两处)都有 exit 0 —— 函数定义了
+# 却永远不会被调用,等于没改。
+#
+# 要解决的故障:内网其他设备都能被穿透访问,偏偏本机不通。
+# mihomo 的 auto-route 在 table 2022 装了 64.0.0.0/2 dev Mihomo,而 Beyond 的
+# overlay 100.64.0.0/16(CGNAT 段)正好落在里面,优先级高于主表的
+# 100.64.0.0/16 dev utun0。实测:
+#     ip route get 100.64.0.1  →  dev Mihomo table 2022 src 28.0.0.1
+# 于是远端能到达本机,但【回包的目的地 100.64.x 被 mihomo 吃掉】,
+# mihomo 拿着一个 CGNAT 地址去找代理必然失败 —— 单向可达 = 不通。
+# 其他内网设备没跑 mihomo,所以它们正常。
+#
+# 它不依赖网卡状态、也不依赖 /32 路由是否装上(纯策略路由),所以无条件执行。
+# 机制与下面四条节点 /32 相同:比 9001-9004 更高优先级地查主表。
+OVERLAY_CIDR=${BEYOND_OVERLAY_CIDR:-100.64.0.0/16}
+OVERLAY_PRI=8998
+
+install_overlay_bypass() {
+    while ip rule del priority "$OVERLAY_PRI" 2>/dev/null; do :; done
+    if ! ip rule add to "$OVERLAY_CIDR" lookup main priority "$OVERLAY_PRI" 2>/dev/null; then
+        log "✗ overlay bypass 规则安装失败(to $OVERLAY_CIDR pri $OVERLAY_PRI)"
+        return 1
+    fi
+    local got
+    got="$(ip route get "${OVERLAY_CIDR%%/*}" 2>/dev/null | head -1)"
+    case "$got" in
+        *utun0*) log "✓ overlay bypass 就位:$got" ;;
+        *Mihomo*) log "⚠ overlay 仍被 mihomo 接管:$got" ;;
+        *)        log "  overlay 路由决策:${got:-查不到}(utun0 可能尚未建立)" ;;
+    esac
+}
+install_overlay_bypass
+# ────────────────────────────────────────────────────────────────────
 
 # 网卡可用性:不能只查"存在"。拔掉网线后 link 仍然存在(只是 operstate=down),
 # 旧版只查 `ip link show` 会继续执行,把路由装到一条死链路上 —— 而且是在删掉
@@ -99,6 +143,18 @@ if [ "$n" -eq 0 ]; then
 fi
 log "已装 $n 条 /32 路由 → $IFACE$([ "$fail" -gt 0 ] && echo "($fail 条失败)")"
 
+# ── 2b. 策略规则 8999:to <节点> lookup main,抢在 mihomo 的 9002 之前查主表 ──
+# 没有它,tun.route-exclude-address 非空时主表 /32 永远轮不到(见文件头 2026-10-08 补充)。
+RULE_PRI=${BEYOND_RULE_PRI:-8999}
+r=0
+while read -r cidr; do
+    [ -n "$cidr" ] || continue
+    if ! ip rule show priority "$RULE_PRI" 2>/dev/null | grep -q "to ${cidr%/32} "; then
+        ip rule add to "$cidr" lookup main priority "$RULE_PRI" 2>/dev/null && r=$((r+1))
+    fi
+done < "$NEW"
+[ "$r" -gt 0 ] && log "已装 $r 条 priority $RULE_PRI 规则(to 节点 lookup main)"
+
 # ── 3. 剪掉不再需要的旧路由(只删【不在新集合里】的) ──
 pruned=0
 for m in "$MARK" "$COMPAT_MARK"; do
@@ -107,6 +163,7 @@ for m in "$MARK" "$COMPAT_MARK"; do
         [ -n "$old" ] || continue
         grep -qxF "$old" "$NEW" && continue          # 仍在用,别删
         ip route del "$old" 2>/dev/null && { log "  剪除旧路由 $old"; pruned=$((pruned+1)); }
+        while ip rule del to "$old" lookup main priority "$RULE_PRI" 2>/dev/null; do :; done
     done < "$m"
 done
 [ "$pruned" -gt 0 ] && log "剪除 $pruned 条不再需要的旧路由"
@@ -125,3 +182,4 @@ for ip in $ips; do
 done
 [ "$bad" -gt 0 ] && log "⚠ 有 $bad 个目标仍进 TUN,NAT 打洞会失败"
 exit 0
+

@@ -21,6 +21,30 @@ ok()  { "$BIN" -d /etc/mihomo -f "$1" -t >/dev/null 2>&1; }
 
 [ -r "$CFG" ] || { log "配置不存在: $CFG"; exit 0; }
 
+# ── 开机即保证 overlay 绕过写在配置里 ──
+# tun.route-exclude-address 与前置 DIRECT 规则由每日 refresh 维护,但
+# 回滚到 known-good 快照时可能是一份不含它们的旧配置。这里在 mihomo 启动【之前】
+# 补一次,代价是一次 yaml 读写,换来"重启后一定有"。
+python3 - <<'PYEOF' 2>&1 | sed 's/^/  /'
+import sys, yaml
+sys.path.insert(0, "/etc/mihomo")
+CFG = "/etc/mihomo/config.yaml"
+try:
+    from mihomo_groups import ensure_overlay_bypass
+except Exception as e:
+    print("[ensure-config] 无法导入 ensure_overlay_bypass(%s),跳过" % e)
+    sys.exit(0)
+try:
+    cfg = yaml.safe_load(open(CFG))
+except Exception as e:
+    print("[ensure-config] 配置无法解析(%s),跳过 overlay 补写" % e)
+    sys.exit(0)
+n = ensure_overlay_bypass(cfg, log=lambda s: print("[ensure-config]" + s))
+if n:
+    yaml.safe_dump(cfg, open(CFG, "w"), allow_unicode=True, sort_keys=False)
+    print("[ensure-config] 已补写 overlay 绕过 %d 处" % n)
+PYEOF
+
 # 健康检查:能解析 != 能用。若 Proxy / 地区组退化成只剩 DIRECT,
 # 走这些组的规则会静默直连。这种配置绝不能被存成 known-good 快照,
 # 否则坏状态会被固化、连回滚都救不回来(2026-09-25 实际发生过)。

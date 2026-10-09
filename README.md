@@ -49,34 +49,67 @@ gui            # 切回图形
 
 | 层 | 配置 | 避开的坑 |
 |---|---|---|
-| **穿透** | BeyondNetwork edge(host network + privileged,`RestartPolicy=always`),本机**不配虚拟 IP**、只宣告站点子网(当前 `192.168.31.0/24`);底层流量用主表 `/32` 路由从**指定网卡直出,绕开 mihomo TUN**(网卡写在 `/etc/mihomo/beyond.conf`,当前 `eno1`) | 配虚拟 IP 会让 edge 劫持本机去局域网的流量;子网写成 `/16` 会把远端客户端自己的局域网也吸进隧道;**流量若进了 TUN,mihomo 会终结并重发 UDP,NAT 打洞失败 —— 隧道只有保活、`tx` 恒为 0** |
+| **穿透** | BeyondNetwork edge(host network + privileged,`RestartPolicy=always`),本机**不配虚拟 IP**、只宣告站点子网(当前 `192.168.31.0/24`);底层流量用主表 `/32` 路由 + `priority 8999` 的 `to <节点> lookup main` 规则从**指定网卡直出,绕开 mihomo TUN**(网卡写在 `/etc/mihomo/beyond.conf`,当前 `eno1`;8999 是 2026-10-08 补的,因为 `route-exclude-address` 非空后 `suppress_prefixlength 0` 压不住拆分的默认路由) | 配虚拟 IP 会让 edge 劫持本机去局域网的流量;子网写成 `/16` 会把远端客户端自己的局域网也吸进隧道;**流量若进了 TUN,mihomo 会终结并重发 UDP,NAT 打洞失败 —— 隧道只有保活、`tx` 恒为 0** |
 | **回包** | 全机只依赖 `eno1`,**eno2 已禁用** | 曾因双网卡各有默认路由导致请求从 eno2 进、回包从 eno1 出 → 认证超时;现单网卡不再有此问题 |
 | **桌面** | GNOME 桌面共享,端口 **3390**,**关闭端口协商**,停用系统级远程登录 | 端口协商会把客户端重定向到隧道内不可达的端口;3389 上的系统级实例会抢先接管并甩给无凭据的 Handover 进程 |
 
 **效果**:远端直接连 `192.168.31.116:3390`(桌面)或 `ssh descfly@192.168.31.116`(CLI),
 P2P 直连 RTT ≈ 25 ms。远程桌面用镜像主屏模式,**不新建虚拟屏,本机双屏布局(含竖屏)不受扰动**。
 
-### 4. VPN 按域名分流,开机自愈
+### 4. 代理分流:单内核 mihomo,Claude 钉固定 IP
 
-**问题**:Claude 流量需走专用 OpenVPN 隧道,其余走 clash;而 clash 的 TUN 会拦截 OpenVPN 自身的握手,导致隧道建不起来;注销时 clash 退出又会触发路由兜底,打断其他隧道。
+**问题**:Claude 的 API 按出口 IP 做风控,出口漂移就会被限流;其余流量只要快就行。
+早先用一条专用 OpenVPN 隧道承载 Claude 流量,但 clash 的 TUN 会拦截 OpenVPN 的握手、
+注销时又会触发路由兜底,整条链脆弱且难排查。
 
-**做法**:收敛为**单一开机自启入口**,顺序不可颠倒。
+**做法(2026-10-08 定)**:**openvpn3 分流与 claude-vpn-guard 整体撤销**,Claude 的专属出口改在 mihomo 内部实现。
+`mihomo.service` 是唯一开机自启入口,单内核持有 TUN、7897/7899/9097。
 
 ```
 mihomo.service
- ├─ ExecStartPre   → 确保 openvpn3 有有效会话(无 TUN 环境下握手)
- ├─ ExecStart      → mihomo 内核(TUN + 全局分流)
- └─ ExecStartPost  → 拉起路由守护 claude-vpn-guard
+ ├─ ExecStartPre  ① ensure-campus-net.sh      先确认链路能联网(代理排在"能上网"之后)
+ ├─ ExecStartPre  ② ensure-config.sh          配置自检,坏配置回滚 known-good
+ ├─ ExecStart        verge-mihomo              内核 + TUN + rule 分流
+ ├─ ExecStartPost ③ ensure-beyond-underlay.sh Beyond 节点 /32 路由绕开 TUN
+ └─ ExecStartPost ④ ensure-remote-access.sh   健康门禁后重启隧道容器与 RDP
 ```
 
-配置侧放行 VPN 自身的底层流量(`fake-ip-filter` + 前置 `DIRECT` 规则),使隧道在 TUN 运行中也能重连。
+路由策略(规则前置顺序即优先级):
 
-**效果**:开机一条链自动就绪,重启后策略依旧生效。出问题一条命令四阶段重置:
+| 流量 | 去向 | 说明 |
+|---|---|---|
+| 校园网认证页、连通性探测端点、RFC1918 | `DIRECT` | 未认证时也必须能直连 |
+| `anthropic.com` / `claude.ai` / `claude.com` / `claudeusercontent.com` / 其日志端点 / 进程名含 `claude` | `Claude` 组 | **fallback 类型,唯一成员是名字同时含「美国」「小水管」「固定IP」的节点**(当前 5 倍率)。节点挂了 Claude 就不通,**不自动降级**到共享 IP |
+| 其余 2 万余条规则 | 各服务组 → `Auto` / `DIRECT` | `Auto` 是 url-test 自动选优,成员只收 0.5x~1.5x 节点(当前 113 个),5x/3x/2x 不参与 |
+
+`mihomo_groups.py` 在每日刷新时重建这两组、把节点域名写入 `fake-ip-filter`、把 Claude 规则重放到前列,避免订阅换节点后退化。
+
+**效果**:开机一条链自动就绪;`netstack status` 一眼看出内核数、9097 归属与 Claude 出口。
 
 ```bash
-netreset       # 撤销全部影响 → 验证裸机 → 重新施加 → 验证
-netstat-paper  # 状态速览
+netstack status                 # 状态速览(含"是否有第二个内核在抢端口")
+sudo netstack cli               # 从 GUI 收回:杀 GUI 内核,恢复自动栈
+sudo netstack gui               # 保底通道:撤销全部自动配置,交给 Clash Verge 人工接管(不改自启)
+netreset                        # 四阶段重置:撤销 → 验证裸机 → 重新施加 → 验证
 ```
+
+**撤销接口**(把 2026-10-08 的 CCFAC 改动整体退回 / 再施加,各步自带退 GUI、拉起自动栈):
+
+```bash
+bash network/scripts/netstack-ccfac-undo.sh check        # 只看会动什么,不需要 root
+sudo bash network/scripts/netstack-ccfac-undo.sh undo    # 撤销:快照 → 退 GUI 与全部内核 → 恢复 4 个 .bak.ccfac 文件 → 旧逻辑重建配置 → 拉起
+sudo bash network/scripts/netstack-ccfac-undo.sh redo    # 从最新快照恢复 ccfac 状态并拉起
+```
+
+撤销范围**不含 Beyond**(watchdog 脚本、计数、底层路由都不动),也不回滚 `netstack` 本身。
+openvpn3 相关步骤在 `net-reset.sh`、撤销脚本、`netstat-paper` 里**代码保留,由 `OPENVPN3_RETIRED=1` 门禁整段跳过**,运行时只打印"跳过(已撤销)"。
+
+**两个会把内核配置偷偷换掉的东西**(都通过共用的 `127.0.0.1:9097` 往 systemd 内核 `PUT /configs`):
+
+| 推送方 | 触发 | 症状 | 处置 |
+|---|---|---|---|
+| Clash Verge GUI | 手动打开它 | 内核变 `global`、TUN 消失、`Claude` 组变普通 Selector | 退出 GUI,`sudo netstack cli` |
+| 用户级 `claude-vpn-sync.service`(openvpn 残留) | Beyond 的 `utun0` 重新出现(edge 每次随 mihomo 重启) | 同上,**且每次 mihomo 启动约 9 秒后必现** | 已 `systemctl --user disable --now`;`install-ccfac.sh` 第 8 步会做;代码归档在 `deprecated/claude-vpn-sync/` |
 
 ---
 
@@ -132,9 +165,9 @@ netstat-paper  # 状态速览
 │   ├── 开发环境指南.md          完整参考:四个入口、分流原理、故障处置
 │   └── tmux实验操作说明.md      操作速查:五步逻辑 + 两个场景
 ├── network/                     VPN 分流栈 + 远程访问守护
-│   ├── scripts/                 启动链脚本(ensure-*)、netstack、refresh、guard、watchdog、安装脚本
-│   │   └── deprecated/          已证伪的方案,仅作记录
-│   ├── systemd/                 7 个单元文件(mihomo / refresh / guard / watchdog)
+│   ├── scripts/                 启动链脚本(ensure-*)、netstack、net-reset、refresh、mihomo_groups、watchdog、安装脚本、撤销接口
+│   │   └── deprecated/          已证伪 / 已撤销的方案(含 openvpn3 时代的 claude-vpn-sync),仅作记录
+│   ├── systemd/                 单元文件(mihomo / refresh / watchdog 现役;guard 两个仅作历史)
 │   └── config/                  配置占位(含机场凭据与 VPN 凭据,均为空文件,不入库)
 ├── obsidian/                    Obsidian 常驻服务 + REST 看护(CLI 模式下 MCP 可用)
 ├── shell/                       ~/.bashrc 的三个自定义块
@@ -156,8 +189,9 @@ netstat-paper  # 状态速览
 | `dsh <容器>` | 容器里开个临时 shell(断开即死) |
 | `tmux new -A -s <名>` | 宿主机 tmux(建或接) |
 | `cli` / `gui` / `guistat` | 图形与命令行模式切换、状态查看 |
-| `netreset` / `netstat-paper` | 网络栈四阶段重置、状态速览 |
-| `sudo netstack status\|stop\|start\|restart\|reset\|heal` | 整条分流链的开关与自愈 |
+| `netreset` / `netstat-paper` | 网络栈四阶段重置、状态速览(openvpn3 行显示"跳过(已撤销)") |
+| `netstack status` · `sudo netstack stop\|start\|restart\|reset\|heal\|gui\|cli` | 整条分流链的开关、自愈、GUI 交接与收回 |
+| `sudo bash network/scripts/netstack-ccfac-undo.sh check\|undo\|redo` | CCFAC 改动的统一撤销 / 恢复接口(不含 Beyond) |
 | `journalctl -u remote-access-watchdog -f` | 实时查看隧道/RDP 守护的动作 |
 | `cat /run/remote-access-watchdog.state` | 当前连续失败轮数(0 表示正常) |
 | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:27123/` | Obsidian Local REST API 健康检查 |
@@ -173,15 +207,18 @@ netstat-paper  # 状态速览
 ## 部署
 
 ```bash
-sudo bash network/scripts/install.sh              # headless mihomo
-sudo bash network/scripts/install-chain.sh        # 启动链 openvpn3 → mihomo → guard
-sudo bash network/scripts/install-policy-fix.sh   # 放行规则 + guard 路径 + net-reset
+sudo bash network/scripts/install.sh                  # headless mihomo
+sudo bash network/scripts/install-chain.sh            # 启动链 ensure-campus-net → ensure-config → 内核 → beyond → remote-access
 sudo bash network/scripts/install-beyond-underlay.sh  # Beyond 底层出口(网卡由 beyond.conf 决定),绕开 mihomo TUN
-sudo bash network/scripts/disable-eno2.sh         # 禁用 eno2(校园网劫持源),全机只依赖 eno1
-sudo bash network/scripts/install-fix.sh          # 订阅刷新修复 + 启动配置自愈 + netstack
-sudo bash network/scripts/fix-guard-order.sh      # guard 移到启动链最后 + IgnoreOnIsolate
-sudo bash network/scripts/install-watchdog.sh     # 隧道/RDP 守护 + 开启日志持久化
+sudo bash network/scripts/disable-eno2.sh             # 禁用 eno2(校园网劫持源),全机只依赖 eno1
+sudo bash network/scripts/install-campus-first.sh     # 联网优先的启动顺序 + 重启次数上限
+sudo bash network/scripts/install-auto-group.sh       # Auto(url-test)选优组 + refresh 下载重试
+sudo bash network/scripts/install-group-rebuild.sh    # 分组自动重建 + 快照健康门禁
+sudo bash network/scripts/install-ccfac.sh            # CCFAC 订阅 + Claude 固定 IP 组 + 单内核接管 + 摘除 openvpn 自启与 claude-vpn-sync
+sudo bash network/scripts/install-watchdog.sh         # 隧道/RDP 守护 + 开启日志持久化
 ```
+
+已撤销、仅作记录(在 `deprecated/`):`install-policy-fix.sh`、`install-fix.sh`、`fix-guard-order.sh`(均为 openvpn3 / guard 链的安装器)。
 
 全部脚本均幂等,可重复执行;顺序如上。shell 片段需手工并入 `~/.bashrc`。
 
@@ -194,7 +231,8 @@ sudo visudo -c -f /etc/sudoers.d/gui-cli-switch
 
 ## 说明
 
-- `network/config/config.yaml` 含机场节点凭据,**不入库**。从 Clash 客户端导出后放到 `/etc/mihomo/config.yaml` 即可。
+- `network/config/config.yaml` 含机场节点凭据,**不入库**。实际的 `/etc/mihomo/config.yaml` 由 `refresh.py` 从 `/etc/mihomo/sub.url`(0600,不入库)拉订阅生成;`install-ccfac.sh` 会从 Clash Verge 的 `profiles.yaml` 取 CCFAC 的订阅 URL 写入。
+- openvpn3 分流已整体撤销(2026-10-08)。`openvpn3-client` 等包与 `~/Desktop/*.ovpn` 仍在,但没有任何自启入口;`net-reset.sh` / `netstat-paper` / 撤销脚本里的相关逻辑由 `OPENVPN3_RETIRED=1` 门禁跳过。
 - 文档中的 RDP 密码已打码,本机用 `grdctl status --show-credentials` 查看。
 - 远程桌面使用 GNOME Remote Desktop 的桌面共享模式;系统级远程登录需要 TPM,本机(Supermicro X12DAi-N6)无 TPM,故未启用。
 - **eno2 已禁用**(2026-09-25),全机只依赖 `eno1`。eno2 接的是校园网,认证过期后上游用自签

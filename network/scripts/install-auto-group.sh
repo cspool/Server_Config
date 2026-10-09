@@ -78,7 +78,7 @@ echo "[6/6] 自检"
 curl -s -m 5 --noproxy '*' http://127.0.0.1:9097/proxies 2>/dev/null | python3 -c '
 import sys, json
 p = json.load(sys.stdin)["proxies"]
-for g in ("Proxy", "Auto", "香港", "日本", "美国", "新加坡"):
+for g in ("Proxy", "Auto", "Claude"):
     if g in p:
         v = p[g]
         auto = v.get("type") in ("URLTest", "Fallback", "LoadBalance")

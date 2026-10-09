@@ -18,7 +18,8 @@ import os, subprocess, sys, time, urllib.request, shutil, datetime, tempfile
 import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mihomo_groups import rebuild, group_health
+from mihomo_groups import (rebuild, group_health, ensure_claude_rules,
+                           ensure_fakeip_filter, ensure_overlay_bypass)
 
 BASE   = "/etc/mihomo/config.yaml"
 GOOD   = "/etc/mihomo/config.good.yaml"
@@ -129,6 +130,15 @@ def main():
     #     仅剩 DIRECT(2026-09-25 的 github 不通就是这样来的)。
     nrb = rebuild(cfg, log=lambda m: log(m))
     log(f"重建分组 {nrb} 个")
+
+    # 3c. 每天重放两件易丢的事(都曾实际丢过):
+    #     - Claude 规则:2026-10-08 被 remove-claude-routing.sh 一并删掉
+    #     - fake-ip-filter 的节点域名:机场改 CDN 域名后旧条目变成死条目
+    nrc = ensure_claude_rules(cfg, log=lambda m: log(m))
+    nfa, nfr = ensure_fakeip_filter(cfg, log=lambda m: log(m))
+    log(f"Claude 规则补回 {nrc} 条;fake-ip-filter +{nfa}/-{nfr}")
+    nob = ensure_overlay_bypass(cfg, log=lambda m: log(m))
+    log(f"overlay 绕过 TUN:{nob} 处")
 
     # 4. 写临时文件并校验 —— 不通过绝不落地
     fd, tmp = tempfile.mkstemp(dir="/etc/mihomo", prefix=".config.new.")

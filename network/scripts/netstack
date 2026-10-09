@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
-# 网络栈整链控制:openvpn3 → mihomo → claude-vpn-guard
+# 网络栈控制。2026-10-08 起只有一条链:mihomo.service(单内核)。
+# openvpn3 分流与 claude-vpn-guard 已整体撤销,代码保留但不再启用。
 #
 #   netstack status     状态速览
-#   netstack stop       整链停止(含撤销内核残留与 DNS 缓存)
-#   netstack start      整链启动(ExecStartPre 建隧道 → 内核 → guard)
+#   netstack stop       停止(含撤销内核残留与 DNS 缓存)
+#   netstack start      启动(ExecStartPre 链 → 内核 → Beyond/RDP 恢复)
 #   netstack restart    stop + start
 #   netstack reset      四阶段完整重置(= 旧的 net-reset.sh)
 #   netstack heal       只修配置(剔除悬空引用/回滚快照)再重载,不动隧道
+#
+#   netstack gui        【保底通道】撤销全部自动配置,交给 Clash Verge 人工接管
+#   netstack cli        从 GUI 收回,恢复自动栈(日常 / 开机形态)
+#
+# 日常与开机形态都是 cli:mihomo.service 持有 Mihomo TUN 与 7897/7899/9097,
+# 按规则分流,Claude 钉在固定 IP 节点。gui 只是运行期临时交接 ——
+# 它【不改开机自启】,重启后自动回到 cli 形态。
 #
 # 除 status/heal 外均需 root。
 set -uo pipefail
@@ -21,29 +29,41 @@ need_root(){ [ "$(id -u)" = 0 ] || { echo "需要 root: sudo netstack $1"; exit 
 
 cmd_status() {
   printf 'mihomo       : %s / 自启 %s\n' "$(systemctl is-active mihomo)" "$(systemctl is-enabled mihomo 2>&1)"
-  printf 'guard.timer  : %s / 自启 %s (应由 mihomo 拉起)\n' "$(systemctl is-active claude-vpn-guard.timer)" "$(systemctl is-enabled claude-vpn-guard.timer 2>&1)"
   printf 'refresh.timer: %s  下次 %s\n' "$(systemctl is-active mihomo-refresh.timer)" "$(systemctl list-timers mihomo-refresh.timer --no-pager 2>/dev/null | awk 'NR==2{print $1,$2,$3}')"
-  printf 'openvpn3     : %s 个会话  %s\n' "$(runuser -u "$VPN_USER" -- openvpn3 sessions-list 2>/dev/null | grep -c '^ *Path:')" "$(ip -o -4 addr show | awk '$4 ~ /^198\.18\./ {print $2" "$4; exit}')"
   printf 'Mihomo TUN   : %s\n' "$(ip -br addr show Mihomo 2>/dev/null | awk '{print $1" "$3}' || echo 未出现)"
   printf '策略规则     : %s 条 (mihomo 装的 90xx)\n' "$(ip rule show | grep -cE '^90[0-9]{2}:')"
   printf 'table 2022   : %s\n' "$(ip route show table 2022 2>/dev/null | tr '\n' ' ')"
   printf 'table 100    : %s\n' "$(ip route show table 100 2>/dev/null | tr '\n' ' ')"
   printf '兜底路由     : %s 条 (应为 0)\n' "$(ip route show | grep -cE '^0.0.0.0/1|^128.0.0.0/1')"
-  printf 'GUI 内核     : %s (应为 0,GUI 会抢 TUN 与 7897)\n' "$(pgrep -fc 'verge-mihomo -d /home/' 2>/dev/null || echo 0)"
+  # 双内核是最隐蔽的一类故障:GUI 的内核无 TUN 但会抢 7897/7899/9097,
+  # 于是"看起来能用"靠的是 GUI,一进 CLI 模式就退回 systemd 那份配置。
+  # 2026-10-08 实测过一次:两份订阅不同,Claude 走着 GUI 的节点而无人察觉。
+  _ncore=$(pgrep -cx verge-mihomo 2>/dev/null || echo 0)
+  # 必须用 -x(精确匹配进程名):-f 会把调用方自己的 shell 命令行也算进去。
+  _gui=$(pgrep -ax verge-mihomo 2>/dev/null | grep -c -- '-d /home/' || true)
+  if [ "${_gui:-0}" -gt 0 ]; then
+    printf '内核进程     : %s 个 ⚠ 其中 %s 个是 GUI 拉起的 —— 正在抢端口\n' "$_ncore" "$_gui"
+    printf '               修复: sudo netstack cli\n'
+  else
+    printf '内核进程     : %s 个 (单内核,正常)\n' "$_ncore"
+  fi
+  # 9097 到底由谁在听 —— 不看这个就会像 2026-10-08 那样问错了内核。
+  printf '9097 归属     : %s\n' "$(ss -tlnp 2>/dev/null | awk '/127.0.0.1:9097/{print $NF; exit}' || echo 无人监听)"
+  printf 'Claude 出口   : %s\n' "$(curl -s -m 6 --noproxy '*' http://127.0.0.1:9097/proxies/Claude 2>/dev/null \
+      | python3 -c 'import sys,json;d=json.load(sys.stdin);print("%s → %s"%(d.get("type"),d.get("now")))' 2>/dev/null || echo '无 Claude 组')"
   printf '配置校验     : %s\n' "$($BIN -d /etc/mihomo -f "$CFG" -t >/dev/null 2>&1 && echo 通过 || echo '✗ 失败,跑 netstack heal')"
 }
 
 cmd_stop() {
   need_root stop
   hd "停止整链"
-  systemctl stop mihomo.service claude-vpn-guard.timer claude-vpn-guard.service 2>/dev/null; ok "服务已停"
+  systemctl stop mihomo.service 2>/dev/null; ok "mihomo.service 已停"
   for n in verge-mihomo mihomo clash clash-meta; do pkill -x "$n" 2>/dev/null; done
-  pkill -f clash-verge 2>/dev/null; sleep 1; ok "内核进程已清(含 GUI 拉起的)"
-  for sp in $(runuser -u "$VPN_USER" -- openvpn3 sessions-list 2>/dev/null | awk '/^ *Path:/{print $2}'); do
-    runuser -u "$VPN_USER" -- openvpn3 session-manage --session-path "$sp" --disconnect >/dev/null 2>&1
-  done; sleep 2; ok "openvpn3 会话已断开"
+  sleep 1; ok "内核进程已清"
+  # 这里【不】杀 clash-verge —— netstack gui 要把界面留给人工接管。
+  # 要连 GUI 内核一起清时用 netstack cli(它只杀 GUI 那个,不碰 systemd 的)。
   ip link del Mihomo 2>/dev/null && ok "已删除残留 Mihomo 网卡" || ok "Mihomo 网卡不存在"
-  for pri in 9000 9001 9002 9003 9004 9010 50; do while ip rule del priority "$pri" 2>/dev/null; do :; done; done; ok "策略规则已清"
+  for pri in 8999 9000 9001 9002 9003 9004 9010 50; do while ip rule del priority "$pri" 2>/dev/null; do :; done; done; ok "策略规则已清"
   ip route flush table 2022 2>/dev/null; ip route flush table 100 2>/dev/null; ok "路由表已清空"
   for r in 0.0.0.0/1 128.0.0.0/1; do ip route del "$r" 2>/dev/null; done; ok "兜底路由已清"
   resolvectl flush-caches 2>/dev/null && ok "DNS 缓存已刷新(清掉 fake-ip)" || no "flush-caches 失败"
@@ -56,6 +76,56 @@ cmd_start() {
   systemctl start mihomo.service
   sleep 8
   cmd_status
+}
+
+# ───── 保底通道:撤销全部自动配置,交给 GUI 人工接管 ─────
+# 什么时候用:自动栈出问题(节点全挂 / 配置被改坏 / 分流判断不对)且你人在机器前。
+# 它把 systemd 这条链连同内核残留【完全撤掉】,再把端口与路由让给 GUI。
+# 不碰开机自启 —— 重启后自动回到 cli,所以这是"临时接管"而非"切换模式"。
+cmd_gui() {
+  need_root gui
+  cmd_stop
+  hd "已撤销自动配置,交给人工"
+  echo "  撤销范围:mihomo.service、Mihomo TUN、策略规则 9000-9004/9010、"
+  echo "           table 2022/100、兜底 /1 路由、DNS 缓存(fake-ip 已清)。"
+  echo "  /etc/mihomo/config.yaml 本身不动 —— 只是没有进程在用它。"
+  echo
+  echo "  当前应为裸直连:"
+  printf '    默认路由  : %s\n' "$(ip route show default 2>/dev/null | head -1)"
+  printf '    Mihomo    : %s\n' "$(ip -br link show Mihomo 2>/dev/null | awk '{print $2}' || echo 已删除)"
+  printf '    7897/9097 : %s 个在听(应为 0)\n' "$(ss -tln 2>/dev/null | grep -cE '127.0.0.1:(7897|9097)')"
+  echo
+  hd "人工操作"
+  echo "  ① 打开 Clash Verge:应用菜单,或  nohup /usr/bin/clash-verge >/dev/null 2>&1 &"
+  echo "  ② 订阅选 CCFAC.yaml,然后手选一个节点"
+  echo "  ③ 要全局代理 → 界面里开 TUN 模式;只给终端用 → export https_proxy=http://127.0.0.1:7897"
+  echo "  ④ Claude 要固定出口 IP → 手选名字里同时含「美国」「小水管」「固定IP」的那个节点"
+  echo
+  echo "  恢复自动栈:  sudo netstack cli        (或直接重启,开机形态就是 cli)"
+}
+
+# ───── 从 GUI 收回,恢复自动栈 ─────
+cmd_cli() {
+  need_root cli
+  hd "收回控制权,恢复自动栈"
+  local guidir="/home/$VPN_USER/.local/share/io.github.clash-verge-rev.clash-verge-rev"
+  local pids
+  # 只认 -d 指向用户目录的那个内核;systemd 的指向 /etc/mihomo,绝不能误杀。
+  pids=$(pgrep -ax 'verge-mihomo' | awk -v d="$guidir" '$0 ~ d {print $1}')
+  if [ -n "$pids" ]; then
+    pkill -u "$VPN_USER" -x clash-verge 2>/dev/null || true
+    sleep 2
+    for p in $pids; do kill "$p" 2>/dev/null || true; done
+    sleep 2
+    for p in $pids; do kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null || true; done
+    ok "GUI 内核已停(pid: $pids)"
+  else
+    ok "没有 GUI 内核在跑"
+  fi
+  cmd_start
+  echo
+  printf '  内核进程数: %s(应为 1)\n' "$(pgrep -cx verge-mihomo)"
+  ss -tlnp 2>/dev/null | grep -E '9097|7897|7899' | sed 's/^/    /'
 }
 
 cmd_heal() {
@@ -79,5 +149,7 @@ case "${1:-status}" in
   restart) need_root restart; cmd_stop; cmd_start ;;
   reset)   need_root reset; exec /usr/local/sbin/net-reset.sh ;;
   heal)    cmd_heal ;;
+  gui)     cmd_gui ;;
+  cli)     cmd_cli ;;
   *) sed -n '3,12p' "$0" | sed 's/^# \?//'; exit 2 ;;
 esac

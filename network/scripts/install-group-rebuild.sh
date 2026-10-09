@@ -25,7 +25,7 @@ rm -rf /etc/mihomo/__pycache__
 echo "  mihomo_groups.py / refresh.py / prune-dangling-proxies.py / ensure-config.sh"
 
 echo "[3/4] 自检"
-python3 -c "import sys; sys.path.insert(0,'/etc/mihomo'); import mihomo_groups; print('  模块可导入,地区规则 %d 条' % len(mihomo_groups.REGION_PAT))"
+python3 -c "import sys; sys.path.insert(0,'/etc/mihomo'); import mihomo_groups as m; print('  模块可导入;Claude 关键词 %s;Auto 倍率上限 %sx' % (m.CLAUDE_KEYS, m.AUTO_MAX_RATE))"
 bash -n /etc/mihomo/ensure-config.sh && echo "  ensure-config.sh 语法 OK"
 python3 - <<'PYEOF'
 import sys, yaml

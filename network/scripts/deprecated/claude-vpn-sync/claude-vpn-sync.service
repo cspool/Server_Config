@@ -1,0 +1,13 @@
+[Unit]
+Description=Sync OpenVPN tun name into Clash Verge OpenVPN-tun0 outbound (for claude traffic)
+After=graphical-session.target
+
+[Service]
+Type=simple
+# 启动时同步一次，之后监听网卡变化事件（去抖 3 秒）
+ExecStart=/bin/bash -c '%h/.local/bin/claude-vpn-sync.sh; ip monitor link | while read -r _; do sleep 3; timeout 5 cat >/dev/null; %h/.local/bin/claude-vpn-sync.sh; done'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

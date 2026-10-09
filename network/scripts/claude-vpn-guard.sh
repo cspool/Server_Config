@@ -32,6 +32,25 @@ PREV_STATE=$(cat "$STATE_FILE" 2>/dev/null || echo "")
 
 log() { logger -t claude-vpn-guard "$*"; }
 
+# ── 前置门禁:基础联网(校园网 gw 认证)未通时不动手 ──
+# guard 的两种动作都以"能联网"为前提:收窄路由靠判据、兜底态还会热重载 mihomo。
+# 链路断着时判据会误判,热重载更会把尚未刷新的配置固化下来,而真正该做的
+# 只有恢复 gw 认证。读 /run/campus-net-state(remote-access-watchdog 每 5 分钟刷新)。
+# 文件缺失或超过 15 分钟没更新则放行(fail-open)—— 不能让 watchdog 停摆
+# 顺带把 guard 也锁死,那会在 clash 挂掉时失去兜底。
+NETSTATE_FILE=/run/campus-net-state
+if [ -r "$NETSTATE_FILE" ]; then
+    _ns="$(cat "$NETSTATE_FILE" 2>/dev/null)"
+    _age=$(( $(date +%s) - $(stat -c %Y "$NETSTATE_FILE" 2>/dev/null || echo 0) ))
+    if [ "$_age" -le 900 ] && [ -n "$_ns" ] && [ "$_ns" != online ]; then
+        if [ "$PREV_STATE" != netdown ]; then
+            log "基础联网未通(${_ns})→ 本轮不调整路由、不热重载;请先恢复校园网 gw 认证"
+        fi
+        echo netdown > "$STATE_FILE"
+        exit 0
+    fi
+fi
+
 # 往用户的图形桌面发通知（脚本以 root 运行，需借用户的 DISPLAY / D-Bus）
 notify_user() {
     local urgency="$1" title="$2" body="$3" uid

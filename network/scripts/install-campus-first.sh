@@ -15,7 +15,7 @@ UNITS="$SRC"; [ -f "$UNITS/mihomo.service" ] || UNITS="$SRC/../systemd"
 ts="$(date +%Y%m%d-%H%M%S)"
 
 echo "[1/5] 备份"
-for f in /etc/mihomo/ensure-openvpn3.sh /etc/mihomo/remote-access-watchdog.sh \
+for f in /etc/mihomo/remote-access-watchdog.sh \
          /etc/mihomo/config.yaml /etc/systemd/system/mihomo.service; do
   [ -f "$f" ] && cp -a "$f" "$f.bak.campus-$ts" && echo "  → $(basename "$f").bak.campus-$ts"
 done
@@ -26,7 +26,7 @@ install -m 0644 "$SRC/campus-portal-direct.py"    /etc/mihomo/campus-portal-dire
 install -m 0755 "$SRC/ensure-openvpn3.sh"         /etc/mihomo/ensure-openvpn3.sh
 install -m 0755 "$SRC/remote-access-watchdog.sh"  /etc/mihomo/remote-access-watchdog.sh
 install -m 0644 "$UNITS/mihomo.service"           /etc/systemd/system/mihomo.service
-echo "  ensure-campus-net.sh / campus-portal-direct.py / ensure-openvpn3.sh"
+echo "  ensure-campus-net.sh / campus-portal-direct.py"
 echo "  remote-access-watchdog.sh / mihomo.service"
 
 echo "[3/5] 应用认证页直连加固(三层)"
@@ -53,8 +53,6 @@ f = (cfg.get('dns') or {}).get('fake-ip-filter') or []
 print("    fake-ip-filter 含 buaa:", any('buaa' in str(x) for x in f))
 ex = (cfg.get('tun') or {}).get('route-exclude-address') or []
 print("    tun.route-exclude-address:", ex)
-print("    Claude 的 OpenVPN-tun0 规则:",
-      sum(1 for r in rules if 'OpenVPN-tun0' in r), "条")
 PYEOF2
 echo "  ── 重启上限 ──"
 grep -E '^MAX_REBOOTS|^COOLDOWN_SEC|^MIN_UPTIME' /etc/mihomo/remote-access-watchdog.sh | sed 's/^/    /'
@@ -66,7 +64,7 @@ cat <<'TIP'
   开机时(mihomo 的第一个 ExecStartPre):
     链路 online  → 正常走完启动链
     链路 captive → 日志明确提示去认证;应用认证页三层直连加固;
-                   跳过 openvpn3 连接尝试(省 45 秒);不阻断 mihomo 启动
+                   不阻断 mihomo 启动
     链路 offline → 日志指出是物理问题,并说明重启无效
   状态写在 /run/campus-net-state,可随时 cat 查看
 

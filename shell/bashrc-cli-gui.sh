@@ -2,13 +2,13 @@
 if [ ! -f /.dockerenv ] && ! grep -qE 'docker|containerd|kubepods' /proc/1/cgroup 2>/dev/null; then
 
   # 退到 CLI: 停 gdm/Xorg/gnome-shell/桌面共享, 释放显存
-  # 不影响: SSH、mihomo(系统服务)、Docker 容器、openvpn3
+  # 不影响: SSH、mihomo(系统服务)、Docker 容器
   cli() {
     local used
     used=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader 2>/dev/null | tr '\n' ' ')
     echo "即将停止图形会话, 释放显存: ${used:-未知}"
     echo "  终止: gdm / Xorg / gnome-shell / 桌面共享(3390) / 桌面内所有程序"
-    echo "  保留: SSH / mihomo / Docker 容器 / openvpn3"
+    echo "  保留: SSH / mihomo / Docker 容器"
     if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
       echo "  ⚠ 你正在图形会话的终端里, 执行后本窗口会一起关闭(请改用 SSH)"
     fi

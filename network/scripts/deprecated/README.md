@@ -40,3 +40,18 @@ eno1(192.168.31.x)的证书正常(`CN=*.beyondnetwork.cn`),迁移后隧道立即
 新脚本的可迁移性:只需改 `beyond.conf` 里的 `BEYOND_IFACE` 一行,源地址、网关、
 是否需要 `onlink` 全部自动推导 —— 换网卡不必再改代码。
 
+
+## 2026-10-08:claude-vpn-sync(用户级服务)归档
+
+`claude-vpn-sync/` 下是 openvpn3 时代的用户级单元 `claude-vpn-sync.service` 与脚本。
+它的逻辑:监听 `ip monitor link`,找一个**不是 Mihomo 的 tun 设备**当作 OpenVPN 的 tun,
+把 Clash Verge 的 `clash-verge.yaml` 打补丁后 `PUT /configs` 推进 `127.0.0.1:9097`。
+
+**为什么必须停**:openvpn3 撤销后,Beyond 的 `utun0` 正好满足"不是 Mihomo 的 tun"。
+于是每当 edge 容器重启、`utun0` 重新出现(mihomo 每次启动的 ExecStartPost 都会重启 edge),
+它就把 **GUI 的 profile(global 模式、无 TUN、Claude 组为普通 Selector)推进 systemd 内核**,
+症状是启动约 9 秒后 `mode` 变 `global`、`Mihomo` TUN 消失、`Claude` 组从 fallback 变 Selector。
+2026-10-08 当天被误判为"Clash Verge GUI 在推配置"两次,真正的持续推送方是它。
+
+已执行:`systemctl --user disable --now claude-vpn-sync.service`(install-ccfac.sh 第 8 步也会做)。
+原文件仍在 `~/.local/bin/claude-vpn-sync.sh` 与 `~/.config/systemd/user/claude-vpn-sync.service`,未删除。

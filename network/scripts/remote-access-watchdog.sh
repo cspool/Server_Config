@@ -40,6 +40,60 @@ REBOOTCNT=/var/lib/remote-access-watchdog.rebootcount   # 跨重启的连续重�
 
 log() { printf '[remote-access-watchdog] %s\n' "$*"; }
 
+NETSTATE_FILE=/run/campus-net-state   # 基础联网状态,本脚本每轮刷新,供 guard 等组件共用
+
+# 基础联网状态:online / captive / offline。
+# 现场探测,同进程内缓存一次(每轮是独立进程,所以缓存粒度正好是一轮),
+# 并写入 $NETSTATE_FILE —— ensure-campus-net.sh 只在 mihomo 启动时写一次,
+# 那是开机快照;其它基于网络的 guard/watchdog 必须读到新鲜值,
+# 否则会拿着几小时前的结论做决定。
+_LINK_STATE=""
+
+# 探测端点顺序:国内优先。
+# 为什么不把 connectivitycheck.gstatic.com 放在前面(它曾是主端点):
+#   它只在 mihomo 加载了含 "DOMAIN-SUFFIX,...,DIRECT" 规则的正确配置时才直连。
+#   2026-10-07 实测,mihomo 被换成 GUI 旧配置后该规则不存在,这个探测被送去
+#   早已失效的节点、返回 000 —— 于是"节点全挂"被误判成"链路断开"。
+#   链路探测绝不能依赖"分流配置是正确的",否则就是循环依赖。
+#   下面三个都是国内可直连的 204 端点,且同样在规则前列被钉成 DIRECT。
+LINK_PROBES_204="http://connect.rom.miui.com/generate_204
+http://wifi.vivo.com.cn/generate_204
+http://connectivitycheck.platform.hicloud.com/generate_204"
+LINK_PROBE_ALT="http://www.msftconnecttest.com/connecttest.txt"
+
+# 基础联网状态:online / captive / offline。
+# 现场探测,同进程内缓存一次(每轮是独立进程,缓存粒度正好是一轮),
+# 并写入 $NETSTATE_FILE —— ensure-campus-net.sh 只在 mihomo 启动时写一次,
+# 那是开机快照;其它基于网络的 guard/watchdog 必须读到新鲜值,
+# 否则会拿着几小时前的结论做决定。
+link_state() {
+    [ -n "$_LINK_STATE" ] && { printf '%s\n' "$_LINK_STATE"; return; }
+    local s=offline u code any=0 body
+    for u in $LINK_PROBES_204; do
+        code="$(curl -s --noproxy '*' -m 5 -o /dev/null -w '%{http_code}' "$u" 2>/dev/null)"
+        case "${code:-000}" in
+            204) s=online; break ;;      # 干净的 204 → 链路通且无劫持
+            000) : ;;                    # 无响应,换下一个
+            *)   any=1 ;;                # 有响应但不是 204 → 多半被认证页劫持
+        esac
+    done
+    if [ "$s" != online ]; then
+        body="$(mktemp)"
+        code="$(curl -s --noproxy '*' -m 6 -o "$body" -w '%{http_code}' "$LINK_PROBE_ALT" 2>/dev/null)"
+        if [ "${code:-000}" = 200 ] && ! grep -qiE 'location\.href|portal|srun|gw\.buaa' "$body" 2>/dev/null; then
+            s=online
+        elif [ "${code:-000}" != 000 ]; then
+            s=captive
+        elif [ "$any" = 1 ]; then
+            s=captive
+        fi
+        rm -f "$body"
+    fi
+    _LINK_STATE="$s"
+    printf '%s' "$s" > "$NETSTATE_FILE" 2>/dev/null || true
+    printf '%s\n' "$s"
+}
+
 # ───── 隧道健康判据(2026-09-25 重做)─────
 #
 # 旧判据只看「edge 与任一节点有 UDP :3005 ESTAB」。它在 2026-09-25 的事故里
@@ -82,7 +136,11 @@ control_plane_up() {
 # ② edge 是否在持续报错(用行数增量,避免解析时间戳与时区)
 edge_erroring() {
     local cur prev
-    cur=$(docker exec "$EDGE" sh -c "grep -c '\\[E\\]' /var/log/edge.log 2>/dev/null" 2>/dev/null | tr -d '\r')
+    # edge 的日志按天轮转:当前文件是 edge.log,0 点会被转成 edge.<日期>.log。
+    # 旧写法只读 edge.log —— 每天 0 点之后它就是个 0 字节的新文件,
+    # [E] 计数永远是 0,判据②从此全瞎(2026-10-09 实测到)。
+    # 这里统计「当前文件 + 最新一个轮转文件」的总和。
+    cur=$(docker exec "$EDGE" sh -c "cat /var/log/edge.log \$(ls -1t /var/log/edge.*.log 2>/dev/null | head -1) 2>/dev/null | grep -c '\\[E\\]'" 2>/dev/null | tr -d '\r')
     case "$cur" in ''|*[!0-9]*) return 1 ;; esac      # 读不到就不判错
     prev=$(cat "$ERRCNT" 2>/dev/null); case "$prev" in ''|*[!0-9]*) prev=$cur ;; esac
     echo "$cur" > "$ERRCNT"
@@ -99,6 +157,13 @@ tunnel_up() {
 }
 
 restart_edge() {
+    # 基础联网没通时 edge 根本连不上控制面,重启容器纯属徒劳 ——
+    # 2026-10-07 断链 5 小时期间每 5 分钟重启一次,共 60 余次,全部无效。
+    local _ns; _ns="$(link_state)"
+    if [ "$_ns" != online ]; then
+        log "跳过重启隧道容器($1):链路状态 ${_ns},edge 连不上控制面"
+        return 1
+    fi
     log "重启隧道容器($1)"
     docker restart "$EDGE" >/dev/null 2>&1 || { log "✗ docker restart 失败"; return 1; }
     for _ in $(seq 20); do
@@ -147,21 +212,10 @@ do_reboot() {
     fi
 
     # ── 链路本身不通 → 重启毫无意义,直接停手 ──
-    # /run/campus-net-state 由 mihomo 的第一个 ExecStartPre(ensure-campus-net.sh)写入,
-    # 但那只是开机时的快照;这里现场再探一次,避免拿着过期结论做决定。
-    local netstate=""
-    if curl -s --noproxy '*' -m 6 -o /dev/null -w '%{http_code}' \
-         http://connectivitycheck.gstatic.com/generate_204 2>/dev/null | grep -q '^204$'; then
-        netstate=online
-    else
-        # 再探一个端点,单点失败不作数
-        if curl -s --noproxy '*' -m 6 -o /dev/null \
-             http://www.msftconnecttest.com/connecttest.txt 2>/dev/null; then
-            netstate=captive      # 能连上但不是干净的 204 → 多半是认证劫持
-        else
-            netstate=offline
-        fi
-    fi
+    # 与 bump_anyfail 共用同一次探测(link_state 在本进程内缓存),
+    # 保证"累加判定"和"重启判定"看到的是同一个链路状态。
+    local netstate
+    netstate="$(link_state)"
     if [ "$netstate" != online ]; then
         log "⚠ 达到重启阈值,但链路状态为 ${netstate} → 不重启"
         case "$netstate" in
@@ -204,12 +258,98 @@ do_reboot() {
 # 累加"未确认健康"计数并在达到 L4 时重启。任何失败分支都要调它 ——
 # 这样反复抖动(每轮走不同分支)也能升级,而不是被各自的清零互相抵消。
 bump_anyfail() {
-    local a
+    local a _ns
+    # 【2026-10-07 修】基础联网没通时不累加,而且归零。
+    # 原因:链路断了隧道必然连不上,这不是"自愈 20 分钟无效",而是前置条件缺失。
+    # 旧逻辑无条件累加 → 断链 5 小时后计数爬到 59/5,链路一恢复的那一轮
+    # do_reboot 的门禁放行,立刻重启主机 —— 把本该给自愈的 20 分钟窗口吃掉了。
+    # 归零而非冻结:认证/链路恢复后要重新给足 L4_ROUNDS 轮自愈机会。
+    # 持续 captive 会一直归零、永不重启,这是对的:重启修不了认证。
+    _ns="$(link_state)"
+    if [ "$_ns" != online ]; then
+        a="$(cat "$ANYFAIL" 2>/dev/null || echo 0)"
+        [ "${a:-0}" != 0 ] && log "  链路 ${_ns} → 未确认健康计数归零(此前 ${a} 轮),不累加"
+        case "$_ns" in
+            captive) log "  链路需要认证(校园网 gw);认证通过后自愈计时才重新开始。" ;;
+            offline) log "  链路完全不通(网线/上游设备);重启修不了物理问题。" ;;
+        esac
+        echo 0 > "$ANYFAIL"; echo 0 > "$STATE"
+        return
+    fi
     a="$(cat "$ANYFAIL" 2>/dev/null || echo 0)"; case "$a" in ''|*[!0-9]*) a=0 ;; esac
     a=$((a + 1)); echo "$a" > "$ANYFAIL"
     log "  未确认健康累计 ${a}/${L4_ROUNDS} 轮(约 $(((a-1)*5)) 分钟)"
     [ "$a" -ge "$L4_ROUNDS" ] && do_reboot
 }
+
+# ───── 运行中的 mihomo 配置是否还是 /etc/mihomo/config.yaml ─────
+# 2026-10-07 实测事故:开机 18:11 加载的是对的配置,之后被 PUT 成了 Clash Verge
+# GUI 的 clash-verge.yaml —— 51 个早已失效的节点(*.babyqq.cc 全部 NXDOMAIN)、
+# 没有 Auto 组。境外整整断了 4 小时,而隧道判据全绿、watchdog 一声没响:
+# 隧道走 Beyond,不经 clash,所以旧判据永远发现不了这类故障。
+# 这里用"节点名集合"对账,不一致就重载回磁盘配置。
+ensure_running_config() {
+    local out rc
+    out="$(python3 - <<'PYEOF_CFG'
+import json, sys, urllib.request, yaml
+try:
+    api = json.loads(urllib.request.urlopen('http://127.0.0.1:9097/proxies', timeout=5).read())['proxies']
+except Exception:
+    sys.exit(0)                       # API 不通不是本函数该管的事
+kinds = ('Shadowsocks', 'Vmess', 'Trojan', 'Hysteria2', 'Vless', 'ShadowsocksR')
+run = {k for k, v in api.items() if v.get('type') in kinds}
+try:
+    disk = {p['name'] for p in (yaml.safe_load(open('/etc/mihomo/config.yaml')).get('proxies') or [])
+            if p.get('server')}
+except Exception:
+    sys.exit(0)
+if not disk or run == disk:
+    sys.exit(0)
+print('运行中 %d 个节点 / 磁盘 %d 个,交集 %d' % (len(run), len(disk), len(run & disk)))
+sys.exit(1)
+PYEOF_CFG
+)"; rc=$?
+    [ "$rc" -eq 1 ] || return 0
+    log "⚠ mihomo 运行中的节点集合与 /etc/mihomo/config.yaml 不一致(${out})"
+    log "  → 热重载回磁盘配置(境外连通性依赖它)"
+    if curl -s -o /dev/null -m 15 --noproxy '*' -X PUT -H 'Content-Type: application/json' \
+            -d '{"path":"/etc/mihomo/config.yaml","force":true}' \
+            'http://127.0.0.1:9097/configs?force=true' 2>/dev/null; then
+        log "  ✓ 已重载"
+        logger -t remote-access-watchdog "mihomo 配置漂移,已重载回 /etc/mihomo/config.yaml"
+    else
+        log "  ✗ 重载失败,请人工:sudo systemctl restart mihomo"
+    fi
+}
+
+# 配置漂移对账:只在基础联网正常时做(断链时节点本来就连不上,重载没意义)。
+# link_state 在本进程内缓存,这里不会多发探测。
+[ "$(link_state)" = online ] && ensure_running_config
+
+# ───── overlay 段是否仍绕开 mihomo TUN ─────
+# 为什么要每轮查:这条 ip rule 活在内核运行态里,任何人 `netstack stop`、
+# `net-reset`、手工 `ip rule flush`、或 mihomo 重装 auto-route 都可能把它带走。
+# 一旦丢了,症状是"内网别的设备能穿透、本机不通",而隧道判据全绿、
+# 没有任何报错 —— 和 2026-10-09 的实际故障一模一样,靠日志永远发现不了。
+ensure_overlay_bypass_rule() {
+    local cidr=100.64.0.0/16 pri=8998 got
+    got="$(ip route get "${cidr%%/*}" 2>/dev/null | head -1)"
+    case "$got" in
+        *utun0*) return 0 ;;                 # 正常,静默
+    esac
+    log "⚠ overlay 段未绕开 TUN(ip route get ${cidr%%/*} → ${got:-查不到})→ 补装规则"
+    while ip rule del priority "$pri" 2>/dev/null; do :; done
+    if ip rule add to "$cidr" lookup main priority "$pri" 2>/dev/null; then
+        got="$(ip route get "${cidr%%/*}" 2>/dev/null | head -1)"
+        log "  ✓ 已补装(priority $pri);现在:$got"
+        logger -t remote-access-watchdog "overlay bypass 规则丢失已自动补装"
+    else
+        log "  ✗ 补装失败,内网穿透到本机会单向不通"
+    fi
+}
+
+# 每轮先确认 overlay 段没被 mihomo 抢走(与隧道健康无关,独立检查)
+ensure_overlay_bypass_rule
 
 st="$(docker inspect -f '{{.State.Status}}' "$EDGE" 2>/dev/null || echo missing)"
 if [ "$st" = missing ]; then
